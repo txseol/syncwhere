@@ -1,42 +1,27 @@
 require("dotenv").config();
 
 const express = require("express");
-const session = require("express-session");
+const jwt = require("jsonwebtoken");
+const http = require("http");
+const WebSocket = require("ws");
+const cors = require("cors");
+
 const app = express();
+app.use(express.json());
+app.use(cors({ origin: true, credentials: true }));
 
 // 환경 변수
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const REDIRECT_URI = process.env.REDIRECT_URI;
+const JWT_SECRET = process.env.JWT_SECRET || "your-jwt-secret-key";
 
-// 세션 설정
-app.use(
-  session({
-    secret: "your-secret-key", // 세션 암호화 키
-    resave: false,
-    saveUninitialized: false,
-    cookie: { secure: false }, // HTTPS를 사용하는 경우 secure: true로 설정
-  })
-);
-
-// Google OAuth 로그인 시작
-app.get("/auth/google", (req, res) => {
-  const url =
-    "https://accounts.google.com/o/oauth2/v2/auth" +
-    "?response_type=code" +
-    `&client_id=${GOOGLE_CLIENT_ID}` +
-    `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
-    "&scope=openid%20email";
-
-  res.redirect(url);
-});
-
-// Google OAuth 콜백
-app.get("/auth/google/callback", async (req, res) => {
-  const code = req.query.code;
+// Google OAuth 로그인 API
+app.post("/api/auth/google", async (req, res) => {
+  const { code, platform } = req.body;
 
   try {
-    // 1️⃣ code → access token 교환
+    // code → access token 교환
     const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -50,67 +35,73 @@ app.get("/auth/google/callback", async (req, res) => {
     });
 
     const tokenData = await tokenRes.json();
+    if (tokenData.error)
+      return res.status(400).json({ error: tokenData.error });
 
-    if (tokenData.error) {
-      console.error("Error exchanging code for token:", tokenData.error);
-      return res.status(400).send("Failed to exchange code for token");
-    }
-
-    // 2️⃣ 액세스 토큰으로 사용자 정보 요청
+    // 사용자 정보 요청
     const userRes = await fetch(
       "https://www.googleapis.com/oauth2/v2/userinfo",
       {
-        headers: {
-          Authorization: `Bearer ${tokenData.access_token}`,
-        },
+        headers: { Authorization: `Bearer ${tokenData.access_token}` },
       }
     );
 
     const user = await userRes.json();
+    if (user.error) return res.status(400).json({ error: user.error });
 
-    if (user.error) {
-      console.error("Error fetching user info:", user.error);
-      return res.status(400).send("Failed to fetch user info");
-    }
-
-    console.log("Google User:", user);
-
-    // 3️⃣ 세션에 사용자 정보 저장
-    req.session.user = user;
-
-    // 로그인 성공 후 루트 페이지로 리다이렉트
-    res.redirect("/");
-  } catch (error) {
-    console.error("Error during OAuth process:", error);
-    if (!res.headersSent) {
-      res.status(500).send("Internal Server Error");
-    }
-  }
-});
-
-// 루트 페이지
-app.get("/", (req, res) => {
-  if (req.session.user) {
-    // 로그인된 경우
-    res.send(
-      `루트 페이지입니다. 로그인 성공! 사용자: ${req.session.user.email}`
+    // JWT 발급
+    const token = jwt.sign(
+      { userid: user.id, email: user.email, platform: platform || "unknown" },
+      JWT_SECRET,
+      { expiresIn: "24h" }
     );
-  } else {
-    // 로그인되지 않은 경우
-    res.send("루트 페이지입니다. 로그인이 필요합니다.");
+
+    res.json({ token, user: { userid: user.id, email: user.email } });
+  } catch (error) {
+    console.error("OAuth Error:", error);
+    res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
-// 로그아웃
-app.get("/logout", (req, res) => {
-  req.session.destroy((err) => {
-    if (err) {
-      console.error("Error destroying session:", err);
-      return res.status(500).send("Failed to log out");
-    }
-    res.send("로그아웃 완료");
+// HTTP + WebSocket 서버 (nginx 뒤에서 동작, SSL termination은 nginx가 담당)
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+// WebSocket 연결 처리 (nginx에서 wss → ws 프록시됨)
+wss.on("connection", (ws, req) => {
+  // URL 파라미터에서 token 추출 (안전한 방식)
+  const urlParts = req.url?.split("?");
+  const token = urlParts?.[1]
+    ? new URLSearchParams(urlParts[1]).get("token")
+    : null;
+
+  if (!token) return ws.close(1008, "No token");
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) return ws.close(1008, "Invalid token");
+
+    ws.user = user;
+    console.log(`WS 연결: ${user.email} (${user.platform})`);
+
+    ws.on("message", (msg) => {
+      try {
+        const { event, data } = JSON.parse(msg);
+
+        if (event === "ping") {
+          ws.send(
+            JSON.stringify({
+              event: "pong",
+              data: { time: Date.now(), message: "pong" },
+            })
+          );
+        }
+      } catch (e) {
+        console.error("Message Error:", e);
+      }
+    });
+
+    ws.on("close", () => console.log(`WS 종료: ${user.email}`));
   });
 });
 
-// 서버 실행
-app.listen(3000, () => console.log("실행중"));
+server.listen(3000, () => console.log("실행중"));
