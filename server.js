@@ -45,9 +45,11 @@ app.get("/auth/google/callback", async (req, res) => {
 
   const user = await userRes.json();
 
-  console.log("Google User:", user.id, user.email);
+  console.log("Google User:", user);
 
   res.send("로그인 성공: " + JSON.stringify(user));
+  //   루트페이지로 리다이렉트
+  res.redirect("/");
 });
 
 app.get("/logout", (req, res) => {
@@ -55,4 +57,4 @@ app.get("/logout", (req, res) => {
   res.send("로그아웃 완료");
 });
 
-app.listen(3000, () => console.log("https://localhost:3000"));
+app.listen(3000, () => console.log("실행중"));
