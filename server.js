@@ -2,7 +2,6 @@ require("dotenv").config();
 
 const express = require("express");
 const session = require("express-session");
-const fetch = require("node-fetch"); // Node.js 18 이하일 경우 필요
 const app = express();
 
 // 환경 변수
