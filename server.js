@@ -55,4 +55,4 @@ app.get("/logout", (req, res) => {
   res.send("로그아웃 완료");
 });
 
-app.listen(3000, () => console.log("http://localhost:3000"));
+app.listen(3000, () => console.log("https://localhost:3000"));
