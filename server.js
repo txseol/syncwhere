@@ -16,7 +16,18 @@ const JWT_SECRET = process.env.JWT_SECRET || "your-jwt-secret-key";
 
 // Google OAuth 로그인 API (nginx에서 /api → :3000 프록시)
 app.post("/auth/google", async (req, res) => {
-  const { code, platform } = req.body;
+  const { code, platform, redirect_uri } = req.body;
+
+  // 디버깅 로그
+  console.log("=== OAuth 요청 받음 ===");
+  console.log("code:", code ? code.substring(0, 20) + "..." : "없음");
+  console.log("platform:", platform);
+  console.log("클라이언트 redirect_uri:", redirect_uri);
+  console.log("서버 REDIRECT_URI:", REDIRECT_URI);
+
+  // 클라이언트에서 보낸 redirect_uri 사용 (없으면 환경변수 사용)
+  const finalRedirectUri = redirect_uri || REDIRECT_URI;
+  console.log("최종 사용할 redirect_uri:", finalRedirectUri);
 
   try {
     // code → access token 교환
@@ -27,14 +38,23 @@ app.post("/auth/google", async (req, res) => {
         code,
         client_id: GOOGLE_CLIENT_ID,
         client_secret: GOOGLE_CLIENT_SECRET,
-        redirect_uri: REDIRECT_URI,
+        redirect_uri: finalRedirectUri,
         grant_type: "authorization_code",
       }),
     });
 
     const tokenData = await tokenRes.json();
-    if (tokenData.error)
-      return res.status(400).json({ error: tokenData.error });
+    console.log("Google 토큰 응답:", tokenData.error ? tokenData : "성공");
+
+    if (tokenData.error) {
+      console.error("Google 토큰 에러:", tokenData);
+      return res
+        .status(400)
+        .json({
+          error: tokenData.error,
+          error_description: tokenData.error_description,
+        });
+    }
 
     // 사용자 정보 요청
     const userRes = await fetch(
