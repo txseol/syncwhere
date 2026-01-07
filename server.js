@@ -14,8 +14,8 @@ app.use(cors({ origin: true, credentials: true }));
 const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, REDIRECT_URI } = process.env;
 const JWT_SECRET = process.env.JWT_SECRET || "your-jwt-secret-key";
 
-// Google OAuth 로그인 API
-app.post("/api/auth/google", async (req, res) => {
+// Google OAuth 로그인 API (nginx에서 /api → :3000 프록시)
+app.post("/auth/google", async (req, res) => {
   const { code, platform } = req.body;
 
   try {
@@ -63,9 +63,9 @@ app.post("/api/auth/google", async (req, res) => {
 
 // HTTP + WebSocket 서버
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ server, path: "/ws" });
 
-// WebSocket 연결 처리
+// WebSocket 연결 처리 (nginx에서 /ws → :3000/ws 프록시)
 wss.on("connection", (ws, req) => {
   const params = new URLSearchParams(req.url?.split("?")[1] || "");
   const token = params.get("token");
