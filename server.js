@@ -11,9 +11,7 @@ app.use(express.json());
 app.use(cors({ origin: true, credentials: true }));
 
 // 환경 변수
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const REDIRECT_URI = process.env.REDIRECT_URI;
+const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, REDIRECT_URI } = process.env;
 const JWT_SECRET = process.env.JWT_SECRET || "your-jwt-secret-key";
 
 // Google OAuth 로그인 API
@@ -49,7 +47,7 @@ app.post("/api/auth/google", async (req, res) => {
     const user = await userRes.json();
     if (user.error) return res.status(400).json({ error: user.error });
 
-    // JWT 발급
+    // JWT 발급 (구글ID, 이메일, 접속환경을 페이로드로)
     const token = jwt.sign(
       { userid: user.id, email: user.email, platform: platform || "unknown" },
       JWT_SECRET,
@@ -63,17 +61,14 @@ app.post("/api/auth/google", async (req, res) => {
   }
 });
 
-// HTTP + WebSocket 서버 (nginx 뒤에서 동작, SSL termination은 nginx가 담당)
+// HTTP + WebSocket 서버
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// WebSocket 연결 처리 (nginx에서 wss → ws 프록시됨)
+// WebSocket 연결 처리
 wss.on("connection", (ws, req) => {
-  // URL 파라미터에서 token 추출 (안전한 방식)
-  const urlParts = req.url?.split("?");
-  const token = urlParts?.[1]
-    ? new URLSearchParams(urlParts[1]).get("token")
-    : null;
+  const params = new URLSearchParams(req.url?.split("?")[1] || "");
+  const token = params.get("token");
 
   if (!token) return ws.close(1008, "No token");
 
@@ -83,17 +78,24 @@ wss.on("connection", (ws, req) => {
     ws.user = user;
     console.log(`WS 연결: ${user.email} (${user.platform})`);
 
+    // 메시지 수신 처리
     ws.on("message", (msg) => {
       try {
         const { event, data } = JSON.parse(msg);
 
-        if (event === "ping") {
-          ws.send(
-            JSON.stringify({
-              event: "pong",
-              data: { time: Date.now(), message: "pong" },
-            })
-          );
+        switch (event) {
+          case "ping":
+            ws.send(
+              JSON.stringify({
+                event: "pong",
+                data: { time: Date.now(), message: "pong!" },
+              })
+            );
+            break;
+
+          // 추후 이벤트 추가
+          default:
+            break;
         }
       } catch (e) {
         console.error("Message Error:", e);
@@ -104,4 +106,4 @@ wss.on("connection", (ws, req) => {
   });
 });
 
-server.listen(3000, () => console.log("실행중"));
+server.listen(3000, () => console.log("서버 실행중 :3000"));
