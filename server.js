@@ -131,6 +131,10 @@ wss.on("connection", (ws, req) => {
             await handleListChannel(ws, data);
             break;
 
+          case "quitChannel":
+            await handleQuitChannel(ws, data);
+            break;
+
           default:
             break;
         }
@@ -264,6 +268,59 @@ async function handleListChannel(ws, data) {
   );
 
   console.log(`채널 목록 조회: ${userid}`);
+}
+
+// 채널 탈퇴
+async function handleQuitChannel(ws, data) {
+  const { time, userid, channel } = data;
+
+  if (!channel) {
+    return ws.send(
+      JSON.stringify({
+        event: "systemmessage",
+        data: { time: Date.now(), message: "채널명을 입력해주세요." },
+      })
+    );
+  }
+
+  const channelKey = `channel:${channel}`;
+
+  // 채널 존재 여부 확인
+  const exists = await redis.exists(channelKey);
+  if (!exists) {
+    return ws.send(
+      JSON.stringify({
+        event: "systemmessage",
+        data: { time: Date.now(), message: "채널이 존재하지 않습니다." },
+      })
+    );
+  }
+
+  // 유저를 채널에서 제거
+  await redis.sRem(`${channelKey}:users`, userid);
+
+  // 남은 유저 수 확인
+  const remainingUsers = await redis.sCard(`${channelKey}:users`);
+
+  if (remainingUsers === 0) {
+    // 채널에 유저가 없으면 채널 삭제
+    await redis.del(channelKey);
+    await redis.del(`${channelKey}:users`);
+    console.log(`채널 삭제: ${channel} (유저 없음)`);
+  }
+
+  ws.send(
+    JSON.stringify({
+      event: "channelQuitted",
+      data: {
+        time: Date.now(),
+        channel,
+        message: `채널 '${channel}'에서 탈퇴했습니다.`,
+      },
+    })
+  );
+
+  console.log(`채널 탈퇴: ${channel} - ${userid}`);
 }
 
 server.listen(3000, () => console.log("서버 실행중 :3000"));
