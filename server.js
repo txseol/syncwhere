@@ -127,6 +127,10 @@ wss.on("connection", (ws, req) => {
             await handleJoinChannel(ws, data);
             break;
 
+          case "listChannel":
+            await handleListChannel(ws, data);
+            break;
+
           default:
             break;
         }
@@ -235,6 +239,31 @@ async function handleJoinChannel(ws, data) {
   );
 
   console.log(`채널 참여: ${channelName} - ${userid}`);
+}
+
+// 채널 목록 조회
+async function handleListChannel(ws, data) {
+  const { time, userid } = data;
+
+  // channel:* 패턴의 모든 키 조회 (users 키 제외)
+  const keys = await redis.keys("channel:*");
+  const channelKeys = keys.filter((key) => !key.endsWith(":users"));
+
+  const channels = [];
+  for (const key of channelKeys) {
+    const channelName = key.replace("channel:", "");
+    const users = await redis.sMembers(`${key}:users`);
+    channels.push({ channelname: channelName, users });
+  }
+
+  ws.send(
+    JSON.stringify({
+      event: "channelList",
+      data: { time: Date.now(), channels },
+    })
+  );
+
+  console.log(`채널 목록 조회: ${userid}`);
 }
 
 server.listen(3000, () => console.log("서버 실행중 :3000"));
