@@ -5,8 +5,16 @@ const jwt = require("jsonwebtoken");
 const http = require("http");
 const WebSocket = require("ws");
 const cors = require("cors");
+const { createClient } = require("redis");
 
 const app = express();
+
+// Redis 클라이언트
+const redis = createClient({
+  url: process.env.REDIS_URL || "redis://localhost:6379",
+});
+redis.on("error", (err) => console.error("Redis Error:", err));
+redis.connect().then(() => console.log("Redis 연결됨"));
 app.use(express.json());
 app.use(cors({ origin: true, credentials: true }));
 
@@ -97,7 +105,7 @@ wss.on("connection", (ws, req) => {
     console.log(`WS 연결: ${user.email} (${user.platform})`);
 
     // 메시지 수신 처리
-    ws.on("message", (msg) => {
+    ws.on("message", async (msg) => {
       try {
         const { event, data } = JSON.parse(msg);
 
@@ -111,7 +119,14 @@ wss.on("connection", (ws, req) => {
             );
             break;
 
-          // 추후 이벤트 추가
+          case "createChannel":
+            await handleCreateChannel(ws, data);
+            break;
+
+          case "joinChannel":
+            await handleJoinChannel(ws, data);
+            break;
+
           default:
             break;
         }
@@ -123,5 +138,103 @@ wss.on("connection", (ws, req) => {
     ws.on("close", () => console.log(`WS 종료: ${user.email}`));
   });
 });
+
+// === 채널 핸들러 ===
+
+// 채널 생성
+async function handleCreateChannel(ws, data) {
+  const { time, userid, channelName } = data;
+
+  if (!channelName) {
+    return ws.send(
+      JSON.stringify({
+        event: "systemmessage",
+        data: { time: Date.now(), message: "채널명을 입력해주세요." },
+      })
+    );
+  }
+
+  const channelKey = `channel:${channelName}`;
+
+  // 채널 존재 여부 확인
+  const exists = await redis.exists(channelKey);
+  if (exists) {
+    return ws.send(
+      JSON.stringify({
+        event: "systemmessage",
+        data: { time: Date.now(), message: "이미 존재하는 채널입니다." },
+      })
+    );
+  }
+
+  // 채널 생성 (Hash 구조)
+  await redis.hSet(channelKey, {
+    channel: channelName,
+    created: userid,
+    createdAt: Date.now().toString(),
+  });
+  // users는 Set으로 관리
+  await redis.sAdd(`${channelKey}:users`, userid);
+
+  ws.send(
+    JSON.stringify({
+      event: "channelCreated",
+      data: {
+        time: Date.now(),
+        channel: channelName,
+        message: `채널 '${channelName}'이 생성되었습니다.`,
+      },
+    })
+  );
+
+  console.log(`채널 생성: ${channelName} by ${userid}`);
+}
+
+// 채널 참여
+async function handleJoinChannel(ws, data) {
+  const { time, userid, channelName } = data;
+
+  if (!channelName) {
+    return ws.send(
+      JSON.stringify({
+        event: "systemmessage",
+        data: { time: Date.now(), message: "채널명을 입력해주세요." },
+      })
+    );
+  }
+
+  const channelKey = `channel:${channelName}`;
+
+  // 채널 존재 여부 확인
+  const exists = await redis.exists(channelKey);
+  if (!exists) {
+    return ws.send(
+      JSON.stringify({
+        event: "systemmessage",
+        data: { time: Date.now(), message: "채널이 존재하지 않습니다." },
+      })
+    );
+  }
+
+  // 사용자를 채널에 추가
+  await redis.sAdd(`${channelKey}:users`, userid);
+
+  // 채널 정보 조회
+  const users = await redis.sMembers(`${channelKey}:users`);
+
+  ws.send(
+    JSON.stringify({
+      event: "channelJoined",
+      data: {
+        time: Date.now(),
+        channel: channelName,
+        users,
+        message: `채널 '${channelName}'에 참여했습니다.`,
+      },
+    })
+  );
+
+  console.log(`채널 참여: ${channelName} - ${userid}`);
+}
 
 server.listen(3000, () => console.log("서버 실행중 :3000"));
