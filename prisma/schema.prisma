@@ -17,6 +17,7 @@ model UserData {
   email      String?
   name       String?
   picture    String?  // 프로필 이미지 URL
+  status     Int      @default(0)
   createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
   updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
