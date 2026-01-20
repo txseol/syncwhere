@@ -1,0 +1,45 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+}
+
+// 유저 기본 정보 테이블
+model UserData {
+  id         String   @id @default(uuid()) @db.Uuid
+  provider   String   @default("google") // google, github, kakao 등
+  providerId String   @map("provider_id")
+  email      String?
+  name       String?
+  picture    String?  // 프로필 이미지 URL
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  // 관계
+  logins UserLogin[]
+
+  @@unique([provider, providerId])
+  @@map("user_data")
+}
+
+// 유저 로그인 기록 테이블
+model UserLogin {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  platform  String   // browser, vscode, cli 등
+  ip        String?
+  userAgent String?  @map("user_agent")
+  loginAt   DateTime @default(now()) @map("login_at") @db.Timestamptz
+
+  // 관계
+  user UserData @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([loginAt])
+  @@map("user_login")
+}

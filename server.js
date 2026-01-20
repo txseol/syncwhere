@@ -6,8 +6,10 @@ const http = require("http");
 const WebSocket = require("ws");
 const cors = require("cors");
 const { createClient } = require("redis");
+const { PrismaClient } = require("@prisma/client");
 
 const app = express();
+const prisma = new PrismaClient();
 
 // Redis 클라이언트
 const redis = createClient({
@@ -26,16 +28,15 @@ const JWT_SECRET = process.env.JWT_SECRET || "your-jwt-secret-key";
 app.post("/auth/google", async (req, res) => {
   const { code, platform, redirect_uri } = req.body;
 
-  // 디버깅 로그
-  //   console.log("=== OAuth 요청 받음 ===");
-  //   console.log("code:", code ? code.substring(0, 20) + "..." : "없음");
-  //   console.log("platform:", platform);
-  //   console.log("클라이언트 redirect_uri:", redirect_uri);
-  //   console.log("서버 REDIRECT_URI:", REDIRECT_URI);
+  // 클라이언트 IP 추출
+  const ip =
+    req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+    req.socket.remoteAddress ||
+    null;
+  const userAgent = req.headers["user-agent"] || null;
 
   // 클라이언트에서 보낸 redirect_uri 사용 (없으면 환경변수 사용)
   const finalRedirectUri = redirect_uri || REDIRECT_URI;
-  // console.log("최종 사용할 redirect_uri:", finalRedirectUri);
 
   try {
     // code → access token 교환
@@ -52,7 +53,6 @@ app.post("/auth/google", async (req, res) => {
     });
 
     const tokenData = await tokenRes.json();
-    // console.log("Google 토큰 응답:", tokenData.error ? tokenData : "성공");
 
     if (tokenData.error) {
       console.error("Google 토큰 에러:", tokenData);
@@ -67,20 +67,61 @@ app.post("/auth/google", async (req, res) => {
       "https://www.googleapis.com/oauth2/v2/userinfo",
       {
         headers: { Authorization: `Bearer ${tokenData.access_token}` },
-      }
+      },
     );
 
-    const user = await userRes.json();
-    if (user.error) return res.status(400).json({ error: user.error });
+    const googleUser = await userRes.json();
+    if (googleUser.error)
+      return res.status(400).json({ error: googleUser.error });
 
-    // JWT 발급 (구글ID, 이메일, 접속환경을 페이로드로)
+    // DB에 유저 정보 저장 (upsert)
+    const userData = await prisma.userData.upsert({
+      where: {
+        provider_providerId: {
+          provider: "google",
+          providerId: googleUser.id,
+        },
+      },
+      update: {
+        email: googleUser.email,
+        name: googleUser.name,
+        picture: googleUser.picture,
+      },
+      create: {
+        provider: "google",
+        providerId: googleUser.id,
+        email: googleUser.email,
+        name: googleUser.name,
+        picture: googleUser.picture,
+      },
+    });
+
+    // 로그인 기록 저장
+    await prisma.userLogin.create({
+      data: {
+        userId: userData.id,
+        platform: platform || "unknown",
+        ip,
+        userAgent,
+      },
+    });
+
+    // JWT 발급 (내부 UUID, 구글ID, 이메일, 접속환경을 페이로드로)
     const token = jwt.sign(
-      { userid: user.id, email: user.email, platform: platform || "unknown" },
+      {
+        id: userData.id,
+        userid: googleUser.id,
+        email: googleUser.email,
+        platform: platform || "unknown",
+      },
       JWT_SECRET,
-      { expiresIn: "24h" }
+      { expiresIn: "24h" },
     );
 
-    res.json({ token, user: { userid: user.id, email: user.email } });
+    res.json({
+      token,
+      user: { id: userData.id, userid: googleUser.id, email: googleUser.email },
+    });
   } catch (error) {
     console.error("OAuth Error:", error);
     res.status(500).json({ error: "Internal Server Error" });
@@ -92,6 +133,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/ws" });
 
 // WebSocket 연결 처리 (nginx에서 /ws → :3000/ws 프록시)
+// 작업중 - 최초 접속시 토큰 검증
 wss.on("connection", (ws, req) => {
   const params = new URLSearchParams(req.url?.split("?")[1] || "");
   const token = params.get("token");
@@ -115,10 +157,11 @@ wss.on("connection", (ws, req) => {
               JSON.stringify({
                 event: "pong",
                 data: { time: Date.now(), message: "pong!" },
-              })
+              }),
             );
             break;
 
+          // 채널 생성, 가입, 목록조회, 탈퇴
           case "createChannel":
             await handleCreateChannel(ws, data);
             break;
@@ -158,7 +201,7 @@ async function handleCreateChannel(ws, data) {
       JSON.stringify({
         event: "systemmessage",
         data: { time: Date.now(), message: "채널명을 입력해주세요." },
-      })
+      }),
     );
   }
 
@@ -171,7 +214,7 @@ async function handleCreateChannel(ws, data) {
       JSON.stringify({
         event: "systemmessage",
         data: { time: Date.now(), message: "이미 존재하는 채널입니다." },
-      })
+      }),
     );
   }
 
@@ -192,7 +235,7 @@ async function handleCreateChannel(ws, data) {
         channel: channelName,
         message: `채널 '${channelName}'이 생성되었습니다.`,
       },
-    })
+    }),
   );
 
   console.log(`채널 생성: ${channelName} by ${userid}`);
@@ -207,7 +250,7 @@ async function handleJoinChannel(ws, data) {
       JSON.stringify({
         event: "systemmessage",
         data: { time: Date.now(), message: "채널명을 입력해주세요." },
-      })
+      }),
     );
   }
 
@@ -220,7 +263,7 @@ async function handleJoinChannel(ws, data) {
       JSON.stringify({
         event: "systemmessage",
         data: { time: Date.now(), message: "채널이 존재하지 않습니다." },
-      })
+      }),
     );
   }
 
@@ -239,7 +282,7 @@ async function handleJoinChannel(ws, data) {
         users,
         message: `채널 '${channelName}'에 참여했습니다.`,
       },
-    })
+    }),
   );
 
   console.log(`채널 참여: ${channelName} - ${userid}`);
@@ -264,7 +307,7 @@ async function handleListChannel(ws, data) {
     JSON.stringify({
       event: "channelList",
       data: { time: Date.now(), channels },
-    })
+    }),
   );
 
   console.log(`채널 목록 조회: ${userid}`);
@@ -279,7 +322,7 @@ async function handleQuitChannel(ws, data) {
       JSON.stringify({
         event: "systemmessage",
         data: { time: Date.now(), message: "채널명을 입력해주세요." },
-      })
+      }),
     );
   }
 
@@ -292,7 +335,7 @@ async function handleQuitChannel(ws, data) {
       JSON.stringify({
         event: "systemmessage",
         data: { time: Date.now(), message: "채널이 존재하지 않습니다." },
-      })
+      }),
     );
   }
 
@@ -317,7 +360,7 @@ async function handleQuitChannel(ws, data) {
         channel,
         message: `채널 '${channel}'에서 탈퇴했습니다.`,
       },
-    })
+    }),
   );
 
   console.log(`채널 탈퇴: ${channel} - ${userid}`);
