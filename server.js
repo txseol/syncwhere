@@ -7,10 +7,15 @@ const WebSocket = require("ws");
 const cors = require("cors");
 const { createClient } = require("redis");
 const { PrismaClient } = require("@prisma/client");
+const { PrismaPg } = require("@prisma/adapter-pg");
+const { Pool } = require("pg");
 
 const app = express();
-const prisma = new PrismaClient();
 
+// Prisma 7 - PostgreSQL 어댑터 방식
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const adapter = new PrismaPg(pool);
+const prisma = new PrismaClient({ adapter });
 // Redis 클라이언트
 const redis = createClient({
   url: process.env.REDIS_URL || "redis://localhost:6379",
