@@ -12,15 +12,15 @@
   "author": "",
   "license": "Proprietary",
   "dependencies": {
-    "@prisma/adapter-pg": "^7.2.0",
-    "@prisma/client": "^7.2.0",
+    "@prisma/client": "^6.8.2",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.2",
-    "pg": "^8.17.1",
-    "prisma": "^7.2.0",
     "redis": "^4.7.0",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "prisma": "^6.8.2"
   }
 }
