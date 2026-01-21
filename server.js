@@ -70,12 +70,27 @@ async function initPrisma() {
   }
 }
 
-// === Redis 초기화 ===
+// === Redis 초기화 (실시간 문서 동기화용 - 선택적) ===
 const redis = createClient({
   url: process.env.REDIS_URL || "redis://localhost:6379",
+  socket: {
+    reconnectStrategy: (retries) => {
+      if (retries > 3) {
+        console.warn("Redis 재연결 포기 - 실시간 문서 동기화 기능 비활성화");
+        return false; // 재연결 중단
+      }
+      return Math.min(retries * 500, 3000); // 최대 3초 대기
+    },
+  },
 });
 
-redis.on("error", (err) => logError("REDIS", err));
+redis.on("error", (err) => {
+  // 연결 거부 에러는 한 번만 로깅
+  if (err.code !== "ECONNREFUSED" || !redis._errorLogged) {
+    logError("REDIS", err);
+    if (err.code === "ECONNREFUSED") redis._errorLogged = true;
+  }
+});
 redis.on("reconnecting", () => console.log("Redis 재연결 시도중..."));
 
 async function initRedis() {
@@ -97,8 +112,9 @@ async function initRedis() {
     return true;
   } catch (error) {
     logError("REDIS_INIT", error);
-    console.error("Redis 연결 실패 - 서버 종료");
-    process.exit(1);
+    // Redis 연결 실패는 채널 기능에 영향 없음 (추후 문서 동기화에만 사용)
+    console.warn("Redis 연결 실패 - 실시간 문서 동기화 기능 제한됨");
+    return false;
   }
 }
 
@@ -362,7 +378,7 @@ wss.on("connection", (ws, req) => {
   }
 });
 
-// === 채널 핸들러 (Redis 캐시 + Supabase 영속 저장) ===
+// === 채널 핸들러 (Supabase 직접 조회) ===
 
 // 채널 생성
 async function handleCreateChannel(ws, data) {
@@ -424,23 +440,6 @@ async function handleCreateChannel(ws, data) {
         "채널 생성 중 데이터베이스 오류가 발생했습니다.",
       );
     }
-
-    // Redis 캐시에도 저장 (실패해도 진행)
-    await safeRedis(async () => {
-      const channelKey = `channel:${channel.id}`;
-      await redis.hSet(channelKey, {
-        id: channel.id,
-        name: channelName,
-        createdBy: userId,
-        createdAt: channel.createdAt.toISOString(),
-      });
-      await redis.hSet(`${channelKey}:member:${userId}`, {
-        channelId: channel.id,
-        permission: "0",
-        status: "0",
-        joinOrder: "1",
-      });
-    });
 
     safeSend(ws, {
       event: "channelCreated",
@@ -513,19 +512,6 @@ async function handleJoinChannel(ws, data) {
       );
     }
 
-    // Redis 캐시 업데이트 (실패해도 진행)
-    await safeRedis(async () => {
-      const channelKey = `channel:${channel.id}`;
-      await redis.hSet(`${channelKey}:member:${userId}`, {
-        channelId: channel.id,
-        permission: "1",
-        status: "0",
-        joinOrder: joinOrder.toString(),
-      });
-      // 유저 채널 목록 캐시 무효화
-      await redis.del(`user:${userId}:channels`);
-    });
-
     // 멤버 목록 조회
     let updatedChannel;
     try {
@@ -586,26 +572,6 @@ async function handleListChannel(ws, data) {
   const userId = ws.user.id;
 
   try {
-    // Redis 캐시 확인
-    const cacheKey = `user:${userId}:channels`;
-    const cachedChannels = await safeRedis(async () => {
-      return await redis.get(cacheKey);
-    });
-
-    if (cachedChannels) {
-      try {
-        const parsed = JSON.parse(cachedChannels);
-        console.log(`채널 목록 조회 (캐시): ${userId}`);
-        return safeSend(ws, {
-          event: "channelList",
-          data: { time: Date.now(), channels: parsed },
-        });
-      } catch (parseError) {
-        logError("CACHE_PARSE", parseError);
-        // 캐시 파싱 실패 시 DB에서 조회
-      }
-    }
-
     // Supabase에서 유저가 가입한 채널 목록 조회
     let memberships;
     try {
@@ -647,17 +613,12 @@ async function handleListChannel(ws, data) {
       })),
     }));
 
-    // Redis에 캐시 저장 (5분 TTL) - 실패해도 진행
-    await safeRedis(async () => {
-      await redis.setEx(cacheKey, 300, JSON.stringify(channels));
-    });
-
     safeSend(ws, {
       event: "channelList",
       data: { time: Date.now(), channels },
     });
 
-    console.log(`채널 목록 조회 (DB): ${userId}`);
+    console.log(`채널 목록 조회: ${userId}`);
   } catch (error) {
     logError("CHANNEL_LIST", error);
     sendSystemMessage(ws, "채널 목록 조회 중 오류가 발생했습니다.");
@@ -718,17 +679,6 @@ async function handleQuitChannel(ws, data) {
         );
       }
 
-      // Redis 캐시 삭제 (실패해도 진행)
-      await safeRedis(async () => {
-        const channelKey = `channel:${channel.id}`;
-        const memberKeys = await redis.keys(`${channelKey}:member:*`);
-        const keysToDelete = [channelKey, `user:${userId}:channels`];
-        if (memberKeys.length > 0) {
-          keysToDelete.push(...memberKeys);
-        }
-        await redis.del(keysToDelete);
-      });
-
       safeSend(ws, {
         event: "channelQuitted",
         data: {
@@ -759,15 +709,6 @@ async function handleQuitChannel(ws, data) {
         "채널 탈퇴 중 데이터베이스 오류가 발생했습니다.",
       );
     }
-
-    // Redis 캐시 삭제 (실패해도 진행)
-    await safeRedis(async () => {
-      const channelKey = `channel:${channel.id}`;
-      await redis.del([
-        `${channelKey}:member:${userId}`,
-        `user:${userId}:channels`,
-      ]);
-    });
 
     safeSend(ws, {
       event: "channelQuitted",
