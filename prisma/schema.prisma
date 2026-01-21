@@ -51,17 +51,19 @@ model UserLogin {
 
 // 채널 데이터 테이블
 model ChannelData {
-  id        String   @id @default(uuid()) @db.Uuid
-  name      String   @unique // 채널 이름
-  createdBy String   @map("created_by") @db.Uuid // 채널 생성자 UserData.id
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  id         String   @id @default(uuid()) @db.Uuid
+  name       String   @unique // 채널 이름
+  visibility Int      @default(0) // 0: 공개, 1: 비공개
+  createdBy  String   @map("created_by") @db.Uuid // 채널 생성자 UserData.id
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
   // 관계
   creator UserData        @relation(fields: [createdBy], references: [id], onDelete: Cascade)
   members ChannelMember[]
 
   @@index([createdBy])
+  @@index([visibility])
   @@map("channel_data")
 }
 

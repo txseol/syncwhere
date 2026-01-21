@@ -512,42 +512,16 @@ async function handleJoinChannel(ws, data) {
       );
     }
 
-    // 멤버 목록 조회
-    let updatedChannel;
+    // 멤버 수 조회
+    let memberCount;
     try {
-      updatedChannel = await prisma.channelData.findUnique({
-        where: { id: channel.id },
-        include: {
-          members: {
-            include: {
-              user: { select: { id: true, email: true, name: true } },
-            },
-            orderBy: { joinOrder: "asc" },
-          },
-        },
+      memberCount = await prisma.channelMember.count({
+        where: { channelId: channel.id },
       });
     } catch (dbError) {
-      logError("DB_CHANNEL_MEMBERS", dbError);
-      // 멤버 목록 조회 실패해도 가입 성공 메시지 전송
-      return safeSend(ws, {
-        event: "channelJoined",
-        data: {
-          time: Date.now(),
-          channelId: channel.id,
-          channel: channelName,
-          users: [],
-          message: `채널 '${channelName}'에 참여했습니다.`,
-        },
-      });
+      logError("DB_MEMBER_COUNT", dbError);
+      memberCount = joinOrder; // 실패 시 가입 순서로 대체
     }
-
-    const users = updatedChannel.members.map((m) => ({
-      userId: m.user.id,
-      email: m.user.email,
-      name: m.user.name,
-      permission: m.permission,
-      joinOrder: m.joinOrder,
-    }));
 
     safeSend(ws, {
       event: "channelJoined",
@@ -555,7 +529,9 @@ async function handleJoinChannel(ws, data) {
         time: Date.now(),
         channelId: channel.id,
         channel: channelName,
-        users,
+        memberCount,
+        myPermission: 1,
+        myJoinOrder: joinOrder,
         message: `채널 '${channelName}'에 참여했습니다.`,
       },
     });
@@ -567,28 +543,30 @@ async function handleJoinChannel(ws, data) {
   }
 }
 
-// 채널 목록 조회 (해당 유저가 가입한 채널만)
+// 채널 목록 조회 (공개 채널 목록 + 가입 여부)
 async function handleListChannel(ws, data) {
   const userId = ws.user.id;
 
   try {
-    // Supabase에서 유저가 가입한 채널 목록 조회
-    let memberships;
+    // 1. 공개 채널 목록 조회 (visibility = 0)
+    let publicChannels;
     try {
-      memberships = await prisma.channelMember.findMany({
-        where: { userId: userId },
-        include: {
-          channel: {
-            include: {
-              members: {
-                include: {
-                  user: { select: { id: true, email: true, name: true } },
-                },
-                orderBy: { joinOrder: "asc" },
-              },
-            },
+      publicChannels = await prisma.channelData.findMany({
+        where: { visibility: 0 },
+        select: {
+          id: true,
+          name: true,
+          visibility: true,
+          createdAt: true,
+          members: {
+            where: { userId: userId },
+            select: { id: true, permission: true, joinOrder: true },
+          },
+          _count: {
+            select: { members: true },
           },
         },
+        orderBy: { createdAt: "desc" },
       });
     } catch (dbError) {
       logError("DB_CHANNEL_LIST", dbError);
@@ -598,20 +576,18 @@ async function handleListChannel(ws, data) {
       );
     }
 
-    const channels = memberships.map((m) => ({
-      channelId: m.channel.id,
-      channelName: m.channel.name,
-      myPermission: m.permission,
-      myJoinOrder: m.joinOrder,
-      createdAt: m.channel.createdAt,
-      users: m.channel.members.map((member) => ({
-        userId: member.user.id,
-        email: member.user.email,
-        name: member.user.name,
-        permission: member.permission,
-        joinOrder: member.joinOrder,
-      })),
-    }));
+    const channels = publicChannels.map((channel) => {
+      const membership = channel.members[0]; // 가입되어 있으면 1개, 없으면 빈 배열
+      return {
+        channelId: channel.id,
+        channelName: channel.name,
+        memberCount: channel._count.members,
+        createdAt: channel.createdAt,
+        joined: !!membership,
+        myPermission: membership?.permission ?? null,
+        myJoinOrder: membership?.joinOrder ?? null,
+      };
+    });
 
     safeSend(ws, {
       event: "channelList",
