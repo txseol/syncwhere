@@ -24,9 +24,10 @@ model UserData {
   updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
   // 관계
-  logins          UserLogin[]
-  createdChannels ChannelData[]   // 생성한 채널들
-  channelMembers  ChannelMember[] // 가입한 채널 멤버십
+  logins           UserLogin[]
+  createdChannels  ChannelData[]   // 생성한 채널들
+  channelMembers   ChannelMember[] // 가입한 채널 멤버십
+  createdDocuments DocumentData[]  // 생성한 문서들
 
   @@unique([provider, providerId])
   @@map("user_data")
@@ -54,16 +55,19 @@ model ChannelData {
   id         String   @id @default(uuid()) @db.Uuid
   name       String   @unique // 채널 이름
   visibility Int      @default(0) // 0: 공개, 1: 비공개
+  status     Int      @default(0) // 0: 정상, 1: 삭제됨
   createdBy  String   @map("created_by") @db.Uuid // 채널 생성자 UserData.id
   createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
   updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
   // 관계
-  creator UserData        @relation(fields: [createdBy], references: [id], onDelete: Cascade)
-  members ChannelMember[]
+  creator   UserData        @relation(fields: [createdBy], references: [id], onDelete: Cascade)
+  members   ChannelMember[]
+  documents DocumentData[]
 
   @@index([createdBy])
   @@index([visibility])
+  @@index([status])
   @@map("channel_data")
 }
 
@@ -73,7 +77,7 @@ model ChannelMember {
   channelId  String   @map("channel_id") @db.Uuid
   userId     String   @map("user_id") @db.Uuid
   permission Int      @default(1) // 0: 생성자(오너), 1: 일반 멤버
-  status     Int      @default(0) // 0: 정상, 추후 밴/정지 등 확장
+  status     Int      @default(0) // 0: 정상, 1: 탈퇴, 2: 강제퇴장/밴 등
   joinedAt   DateTime @default(now()) @map("joined_at") @db.Timestamptz
   joinOrder  Int      @map("join_order") // 채널 내 가입 순서 (CRDT 우선순위용)
 
@@ -84,5 +88,32 @@ model ChannelMember {
   @@unique([channelId, userId]) // 한 유저는 한 채널에 한 번만 가입
   @@index([channelId])
   @@index([userId])
+  @@index([status])
   @@map("channel_member")
+}
+
+// 문서 데이터 테이블 (CRDT LSEQ 기반)
+model DocumentData {
+  id              String   @id @default(uuid()) @db.Uuid
+  channelId       String   @map("channel_id") @db.Uuid
+  name            String   // 문서 이름
+  content         String   @default("") @db.Text // 문서 본문 (CRDT 스냅샷)
+  logMetadata     Json     @default("[]") @map("log_metadata") // 스냅샷 이후 편집 로그
+  snapshotVersion Int      @default(0) @map("snapshot_version") // 스냅샷 버전 (로그 통합 시 증가)
+  lastSnapshotAt  DateTime @default(now()) @map("last_snapshot_at") @db.Timestamptz // 마지막 스냅샷 시간
+  permission      Int      @default(0) // 0: 채널 멤버 전체 편집 가능, 1: 읽기 전용 등 확장
+  status          Int      @default(0) // 0: 정상, 1: 삭제됨
+  createdBy       String   @map("created_by") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  // 관계
+  channel ChannelData @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  creator UserData    @relation(fields: [createdBy], references: [id], onDelete: Cascade)
+
+  @@unique([channelId, name]) // 같은 채널 내 문서명 중복 방지
+  @@index([channelId])
+  @@index([createdBy])
+  @@index([status])
+  @@map("document_data")
 }

@@ -49,6 +49,31 @@ function sendErrorResponse(ws, event, message) {
   });
 }
 
+// UUID 생성 (crypto 사용)
+const crypto = require("crypto");
+function generateUUID() {
+  return crypto.randomUUID();
+}
+
+// UUID 중복 방지 생성 함수
+async function generateUniqueId(model, maxRetries = 5) {
+  for (let i = 0; i < maxRetries; i++) {
+    const id = generateUUID();
+    try {
+      const existing = await prisma[model].findUnique({ where: { id } });
+      if (!existing) return id;
+      console.warn(
+        `UUID 중복 발생 (${model}): ${id}, 재시도 ${i + 1}/${maxRetries}`,
+      );
+    } catch (error) {
+      // findUnique 실패 시 해당 ID 사용 (테이블이 비어있거나 오류)
+      return id;
+    }
+  }
+  // 최대 재시도 초과 시에도 새 UUID 반환 (극히 드문 경우)
+  return generateUUID();
+}
+
 // === Prisma 초기화 ===
 const prisma = new PrismaClient({
   log: [
@@ -394,11 +419,11 @@ async function handleCreateChannel(ws, data) {
   }
 
   try {
-    // Supabase에서 채널 존재 여부 확인
+    // Supabase에서 채널 존재 여부 확인 (삭제되지 않은 채널만)
     let existingChannel;
     try {
-      existingChannel = await prisma.channelData.findUnique({
-        where: { name: channelName },
+      existingChannel = await prisma.channelData.findFirst({
+        where: { name: channelName, status: 0 },
       });
     } catch (dbError) {
       logError("DB_CHANNEL_FIND", dbError);
@@ -409,12 +434,17 @@ async function handleCreateChannel(ws, data) {
       return sendSystemMessage(ws, "이미 존재하는 채널입니다.");
     }
 
+    // UUID 중복 방지
+    const channelId = await generateUniqueId("channelData");
+    const memberId = await generateUniqueId("channelMember");
+
     // Supabase에 채널 생성 (트랜잭션으로 채널 + 멤버 동시 생성)
     let channel;
     try {
       channel = await prisma.$transaction(async (tx) => {
         const newChannel = await tx.channelData.create({
           data: {
+            id: channelId,
             name: channelName,
             createdBy: userId,
           },
@@ -423,6 +453,7 @@ async function handleCreateChannel(ws, data) {
         // 생성자를 멤버로 추가 (permission: 0 = 오너)
         await tx.channelMember.create({
           data: {
+            id: memberId,
             channelId: newChannel.id,
             userId: userId,
             permission: 0,
@@ -468,12 +499,16 @@ async function handleJoinChannel(ws, data) {
   }
 
   try {
-    // Supabase에서 채널 조회
+    // Supabase에서 채널 조회 (삭제되지 않은 채널만, 활성 멤버만)
     let channel;
     try {
-      channel = await prisma.channelData.findUnique({
-        where: { name: channelName },
-        include: { members: true },
+      channel = await prisma.channelData.findFirst({
+        where: { name: channelName, status: 0 },
+        include: {
+          members: {
+            where: { status: 0 }, // 활성 멤버만
+          },
+        },
       });
     } catch (dbError) {
       logError("DB_CHANNEL_FIND", dbError);
@@ -484,19 +519,94 @@ async function handleJoinChannel(ws, data) {
       return sendSystemMessage(ws, "채널이 존재하지 않습니다.");
     }
 
-    // 이미 가입되어 있는지 확인
-    const existingMember = channel.members.find((m) => m.userId === userId);
-    if (existingMember) {
+    // 기존 멤버십 확인 (탈퇴한 멤버 포함)
+    let existingMember;
+    try {
+      existingMember = await prisma.channelMember.findUnique({
+        where: {
+          channelId_userId: {
+            channelId: channel.id,
+            userId: userId,
+          },
+        },
+      });
+    } catch (dbError) {
+      logError("DB_MEMBER_FIND", dbError);
+      return sendSystemMessage(ws, "멤버 조회 중 오류가 발생했습니다.");
+    }
+
+    // 이미 활성 멤버인 경우
+    if (existingMember && existingMember.status === 0) {
       return sendSystemMessage(ws, "이미 가입된 채널입니다.");
     }
 
-    // 가입 순서 계산 (현재 멤버 수 + 1)
-    const joinOrder = channel.members.length + 1;
+    // 강제 퇴장 등으로 재가입 불가 상태인 경우 (status >= 2)
+    if (existingMember && existingMember.status >= 2) {
+      return sendSystemMessage(ws, "해당 채널에 가입할 수 없습니다.");
+    }
+
+    // 탈퇴한 멤버 재가입 (status === 1)
+    if (existingMember && existingMember.status === 1) {
+      try {
+        await prisma.channelMember.update({
+          where: { id: existingMember.id },
+          data: { status: 0 },
+        });
+      } catch (dbError) {
+        logError("DB_MEMBER_REJOIN", dbError);
+        return sendSystemMessage(ws, "채널 재가입 중 오류가 발생했습니다.");
+      }
+
+      // 활성 멤버 수 조회
+      let memberCount;
+      try {
+        memberCount = await prisma.channelMember.count({
+          where: { channelId: channel.id, status: 0 },
+        });
+      } catch (dbError) {
+        logError("DB_MEMBER_COUNT", dbError);
+        memberCount = channel.members.length + 1;
+      }
+
+      safeSend(ws, {
+        event: "channelJoined",
+        data: {
+          time: Date.now(),
+          channelId: channel.id,
+          channel: channelName,
+          memberCount,
+          myPermission: existingMember.permission,
+          myJoinOrder: existingMember.joinOrder,
+          message: `채널 '${channelName}'에 재참여했습니다.`,
+        },
+      });
+
+      console.log(`채널 재참여: ${channelName} - ${userId}`);
+      return;
+    }
+
+    // 신규 가입: 가입 순서 계산 (전체 멤버 기록 기준, 탈퇴 포함)
+    let maxJoinOrder;
+    try {
+      const result = await prisma.channelMember.aggregate({
+        where: { channelId: channel.id },
+        _max: { joinOrder: true },
+      });
+      maxJoinOrder = result._max.joinOrder || 0;
+    } catch (dbError) {
+      logError("DB_JOIN_ORDER", dbError);
+      maxJoinOrder = channel.members.length;
+    }
+    const joinOrder = maxJoinOrder + 1;
+
+    // UUID 중복 방지
+    const memberId = await generateUniqueId("channelMember");
 
     // Supabase에 멤버 추가
     try {
       await prisma.channelMember.create({
         data: {
+          id: memberId,
           channelId: channel.id,
           userId: userId,
           permission: 1, // 일반 멤버
@@ -512,15 +622,15 @@ async function handleJoinChannel(ws, data) {
       );
     }
 
-    // 멤버 수 조회
+    // 활성 멤버 수 조회
     let memberCount;
     try {
       memberCount = await prisma.channelMember.count({
-        where: { channelId: channel.id },
+        where: { channelId: channel.id, status: 0 },
       });
     } catch (dbError) {
       logError("DB_MEMBER_COUNT", dbError);
-      memberCount = joinOrder; // 실패 시 가입 순서로 대체
+      memberCount = joinOrder;
     }
 
     safeSend(ws, {
@@ -548,22 +658,24 @@ async function handleListChannel(ws, data) {
   const userId = ws.user.id;
 
   try {
-    // 1. 공개 채널 목록 조회 (visibility = 0)
+    // 공개 채널 목록 조회 (visibility = 0, status = 0)
     let publicChannels;
     try {
       publicChannels = await prisma.channelData.findMany({
-        where: { visibility: 0 },
+        where: { visibility: 0, status: 0 },
         select: {
           id: true,
           name: true,
           visibility: true,
           createdAt: true,
           members: {
-            where: { userId: userId },
+            where: { userId: userId, status: 0 }, // 활성 멤버만
             select: { id: true, permission: true, joinOrder: true },
           },
           _count: {
-            select: { members: true },
+            select: {
+              members: { where: { status: 0 } }, // 활성 멤버 수만
+            },
           },
         },
         orderBy: { createdAt: "desc" },
@@ -611,12 +723,16 @@ async function handleQuitChannel(ws, data) {
   }
 
   try {
-    // Supabase에서 채널 조회
+    // Supabase에서 채널 조회 (삭제되지 않은 채널, 활성 멤버만)
     let channel;
     try {
-      channel = await prisma.channelData.findUnique({
-        where: { name: channelName },
-        include: { members: true },
+      channel = await prisma.channelData.findFirst({
+        where: { name: channelName, status: 0 },
+        include: {
+          members: {
+            where: { status: 0 }, // 활성 멤버만
+          },
+        },
       });
     } catch (dbError) {
       logError("DB_CHANNEL_FIND", dbError);
@@ -627,7 +743,7 @@ async function handleQuitChannel(ws, data) {
       return sendSystemMessage(ws, "채널이 존재하지 않습니다.");
     }
 
-    // 멤버십 확인
+    // 멤버십 확인 (활성 멤버만)
     const membership = channel.members.find((m) => m.userId === userId);
     if (!membership) {
       return sendSystemMessage(ws, "가입되지 않은 채널입니다.");
@@ -635,51 +751,58 @@ async function handleQuitChannel(ws, data) {
 
     // 오너(생성자)가 탈퇴하려는 경우
     if (membership.permission === 0) {
-      if (channel.members.length > 1) {
-        return sendSystemMessage(
-          ws,
-          "채널 생성자는 다른 멤버가 있을 때 탈퇴할 수 없습니다. 채널을 삭제하거나 권한을 양도해주세요.",
-        );
-      }
+      // 활성 멤버가 본인만 있는 경우
+      if (channel.members.length === 1) {
+        // 마지막 멤버(오너)가 탈퇴 = 채널 소프트 삭제
+        try {
+          await prisma.$transaction([
+            // 멤버 소프트 삭제
+            prisma.channelMember.update({
+              where: { id: membership.id },
+              data: { status: 1 },
+            }),
+            // 채널 소프트 삭제
+            prisma.channelData.update({
+              where: { id: channel.id },
+              data: { status: 1 },
+            }),
+          ]);
+        } catch (dbError) {
+          logError("DB_CHANNEL_SOFT_DELETE", dbError);
+          return sendSystemMessage(
+            ws,
+            "채널 삭제 중 데이터베이스 오류가 발생했습니다.",
+          );
+        }
 
-      // 마지막 멤버(오너)가 탈퇴 = 채널 삭제
-      try {
-        await prisma.channelData.delete({
-          where: { id: channel.id },
+        safeSend(ws, {
+          event: "channelQuitted",
+          data: {
+            time: Date.now(),
+            channel: channelName,
+            message: `채널 '${channelName}'이 삭제되었습니다. (마지막 멤버 탈퇴)`,
+          },
         });
-      } catch (dbError) {
-        logError("DB_CHANNEL_DELETE", dbError);
-        return sendSystemMessage(
-          ws,
-          "채널 삭제 중 데이터베이스 오류가 발생했습니다.",
-        );
+
+        console.log(`채널 소프트 삭제: ${channelName} (마지막 멤버 탈퇴)`);
+        return;
       }
 
-      safeSend(ws, {
-        event: "channelQuitted",
-        data: {
-          time: Date.now(),
-          channel: channelName,
-          message: `채널 '${channelName}'이 삭제되었습니다. (마지막 멤버 탈퇴)`,
-        },
-      });
-
-      console.log(`채널 삭제: ${channelName} (마지막 멤버 탈퇴)`);
-      return;
+      // 다른 활성 멤버가 있는 경우
+      return sendSystemMessage(
+        ws,
+        "채널 생성자는 다른 멤버가 있을 때 탈퇴할 수 없습니다. 채널을 삭제하거나 권한을 양도해주세요.",
+      );
     }
 
-    // 일반 멤버 탈퇴
+    // 일반 멤버 탈퇴 (소프트 삭제)
     try {
-      await prisma.channelMember.delete({
-        where: {
-          channelId_userId: {
-            channelId: channel.id,
-            userId: userId,
-          },
-        },
+      await prisma.channelMember.update({
+        where: { id: membership.id },
+        data: { status: 1 },
       });
     } catch (dbError) {
-      logError("DB_MEMBER_DELETE", dbError);
+      logError("DB_MEMBER_SOFT_DELETE", dbError);
       return sendSystemMessage(
         ws,
         "채널 탈퇴 중 데이터베이스 오류가 발생했습니다.",
@@ -695,7 +818,7 @@ async function handleQuitChannel(ws, data) {
       },
     });
 
-    console.log(`채널 탈퇴: ${channelName} - ${userId}`);
+    console.log(`채널 탈퇴 (소프트 삭제): ${channelName} - ${userId}`);
   } catch (error) {
     logError("CHANNEL_QUIT", error);
     sendSystemMessage(ws, "채널 탈퇴 중 오류가 발생했습니다.");
