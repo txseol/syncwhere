@@ -97,6 +97,8 @@ model DocumentData {
   id              String   @id @default(uuid()) @db.Uuid
   channelId       String   @map("channel_id") @db.Uuid
   name            String   // 문서 이름
+  dir             String   @default("root") // 상위 디렉토리명 (최상위: root)
+  depth           Int      @default(0) // 디렉토리 깊이 (최상위: 0)
   content         String   @default("") @db.Text // 문서 본문 (CRDT 스냅샷)
   logMetadata     Json     @default("[]") @map("log_metadata") // 스냅샷 이후 편집 로그
   snapshotVersion Int      @default(0) @map("snapshot_version") // 스냅샷 버전 (로그 통합 시 증가)
@@ -111,9 +113,10 @@ model DocumentData {
   channel ChannelData @relation(fields: [channelId], references: [id], onDelete: Cascade)
   creator UserData    @relation(fields: [createdBy], references: [id], onDelete: Cascade)
 
-  @@unique([channelId, name]) // 같은 채널 내 문서명 중복 방지
+  @@unique([channelId, dir, depth, name]) // 같은 채널, 같은 경로 내 문서명 중복 방지
   @@index([channelId])
   @@index([createdBy])
   @@index([status])
+  @@index([dir, depth])
   @@map("document_data")
 }

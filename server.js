@@ -375,6 +375,15 @@ wss.on("connection", (ws, req) => {
               await handleQuitChannel(ws, data);
               break;
 
+            // 문서 생성, 삭제
+            case "createDoc":
+              await handleCreateDoc(ws, data);
+              break;
+
+            case "deleteDoc":
+              await handleDeleteDoc(ws, data);
+              break;
+
             default:
               sendErrorResponse(ws, event, `알 수 없는 이벤트: ${event}`);
               break;
@@ -822,6 +831,253 @@ async function handleQuitChannel(ws, data) {
   } catch (error) {
     logError("CHANNEL_QUIT", error);
     sendSystemMessage(ws, "채널 탈퇴 중 오류가 발생했습니다.");
+  }
+}
+
+// === 문서 핸들러 (채널 오너만 생성/삭제 가능) ===
+
+// 문서 생성 (LSEQ CRDT 기반)
+async function handleCreateDoc(ws, data) {
+  const { channelId, docName, dir = "root", depth = 0 } = data;
+  const userId = ws.user.id;
+
+  // 필수값 검증
+  if (!channelId || typeof channelId !== "string") {
+    return sendSystemMessage(ws, "채널 ID를 입력해주세요.");
+  }
+  if (!docName || typeof docName !== "string") {
+    return sendSystemMessage(ws, "문서명을 입력해주세요.");
+  }
+  if (docName.length > 100) {
+    return sendSystemMessage(ws, "문서명은 100자 이하로 입력해주세요.");
+  }
+  if (typeof dir !== "string" || dir.length > 100) {
+    return sendSystemMessage(ws, "디렉토리명이 올바르지 않습니다.");
+  }
+  if (typeof depth !== "number" || depth < 0 || depth > 20) {
+    return sendSystemMessage(ws, "디렉토리 깊이가 올바르지 않습니다. (0~20)");
+  }
+
+  try {
+    // 채널 존재 여부 및 멤버십 확인
+    let channel;
+    try {
+      channel = await prisma.channelData.findFirst({
+        where: { id: channelId, status: 0 },
+        include: {
+          members: {
+            where: { userId: userId, status: 0 },
+            select: { permission: true, joinOrder: true },
+          },
+        },
+      });
+    } catch (dbError) {
+      logError("DB_CHANNEL_FIND", dbError);
+      return sendSystemMessage(ws, "채널 조회 중 오류가 발생했습니다.");
+    }
+
+    if (!channel) {
+      return sendSystemMessage(ws, "채널이 존재하지 않습니다.");
+    }
+
+    // 멤버십 확인
+    const membership = channel.members[0];
+    if (!membership) {
+      return sendSystemMessage(ws, "해당 채널에 가입되어 있지 않습니다.");
+    }
+
+    // 오너(생성자) 권한 확인 (permission: 0 = 오너)
+    if (membership.permission !== 0) {
+      return sendSystemMessage(
+        ws,
+        "문서 생성 권한이 없습니다. (채널 오너만 가능)",
+      );
+    }
+
+    // 같은 경로에 동일한 이름의 문서 존재 여부 확인 (삭제되지 않은 문서만)
+    let existingDoc;
+    try {
+      existingDoc = await prisma.documentData.findFirst({
+        where: {
+          channelId: channelId,
+          name: docName,
+          dir: dir,
+          depth: depth,
+          status: 0,
+        },
+      });
+    } catch (dbError) {
+      logError("DB_DOC_FIND", dbError);
+      return sendSystemMessage(ws, "문서 조회 중 오류가 발생했습니다.");
+    }
+
+    if (existingDoc) {
+      return sendSystemMessage(
+        ws,
+        "같은 경로에 동일한 이름의 문서가 이미 존재합니다.",
+      );
+    }
+
+    // UUID 중복 방지
+    const docId = await generateUniqueId("documentData");
+
+    // 문서 생성 (LSEQ CRDT 초기 상태)
+    let document;
+    try {
+      document = await prisma.documentData.create({
+        data: {
+          id: docId,
+          channelId: channelId,
+          name: docName,
+          dir: dir,
+          depth: depth,
+          content: "", // 초기 본문 비어있음
+          logMetadata: [], // 초기 로그 비어있음 (LSEQ 편집 기록용)
+          snapshotVersion: 0,
+          permission: 0, // 채널 멤버 전체 편집 가능
+          status: 0,
+          createdBy: userId,
+        },
+      });
+    } catch (dbError) {
+      logError("DB_DOC_CREATE", dbError);
+      // unique constraint 위반 시
+      if (dbError.code === "P2002") {
+        return sendSystemMessage(
+          ws,
+          "같은 경로에 동일한 이름의 문서가 이미 존재합니다.",
+        );
+      }
+      return sendSystemMessage(
+        ws,
+        "문서 생성 중 데이터베이스 오류가 발생했습니다.",
+      );
+    }
+
+    safeSend(ws, {
+      event: "docCreated",
+      data: {
+        time: Date.now(),
+        docId: document.id,
+        channelId: channelId,
+        docName: docName,
+        dir: dir,
+        depth: depth,
+        snapshotVersion: document.snapshotVersion,
+        message: `문서 '${docName}'이 생성되었습니다.`,
+      },
+    });
+
+    console.log(
+      `문서 생성: ${docName} (${document.id}) in ${channelId} at ${dir}/${depth} by ${userId}`,
+    );
+  } catch (error) {
+    logError("DOC_CREATE", error);
+    sendSystemMessage(ws, "문서 생성 중 오류가 발생했습니다.");
+  }
+}
+
+// 문서 삭제 (소프트 삭제)
+async function handleDeleteDoc(ws, data) {
+  const { channelId, docId } = data;
+  const userId = ws.user.id;
+
+  // 필수값 검증
+  if (!channelId || typeof channelId !== "string") {
+    return sendSystemMessage(ws, "채널 ID를 입력해주세요.");
+  }
+  if (!docId || typeof docId !== "string") {
+    return sendSystemMessage(ws, "문서 ID를 입력해주세요.");
+  }
+
+  try {
+    // 채널 존재 여부 및 멤버십 확인
+    let channel;
+    try {
+      channel = await prisma.channelData.findFirst({
+        where: { id: channelId, status: 0 },
+        include: {
+          members: {
+            where: { userId: userId, status: 0 },
+            select: { permission: true },
+          },
+        },
+      });
+    } catch (dbError) {
+      logError("DB_CHANNEL_FIND", dbError);
+      return sendSystemMessage(ws, "채널 조회 중 오류가 발생했습니다.");
+    }
+
+    if (!channel) {
+      return sendSystemMessage(ws, "채널이 존재하지 않습니다.");
+    }
+
+    // 멤버십 확인
+    const membership = channel.members[0];
+    if (!membership) {
+      return sendSystemMessage(ws, "해당 채널에 가입되어 있지 않습니다.");
+    }
+
+    // 오너(생성자) 권한 확인
+    if (membership.permission !== 0) {
+      return sendSystemMessage(
+        ws,
+        "문서 삭제 권한이 없습니다. (채널 오너만 가능)",
+      );
+    }
+
+    // 문서 존재 여부 확인 (삭제되지 않은 문서만)
+    let document;
+    try {
+      document = await prisma.documentData.findFirst({
+        where: {
+          id: docId,
+          channelId: channelId,
+          status: 0,
+        },
+      });
+    } catch (dbError) {
+      logError("DB_DOC_FIND", dbError);
+      return sendSystemMessage(ws, "문서 조회 중 오류가 발생했습니다.");
+    }
+
+    if (!document) {
+      return sendSystemMessage(ws, "문서가 존재하지 않습니다.");
+    }
+
+    // 소프트 삭제 (status: 1)
+    try {
+      await prisma.documentData.update({
+        where: { id: docId },
+        data: { status: 1 },
+      });
+    } catch (dbError) {
+      logError("DB_DOC_SOFT_DELETE", dbError);
+      return sendSystemMessage(
+        ws,
+        "문서 삭제 중 데이터베이스 오류가 발생했습니다.",
+      );
+    }
+
+    safeSend(ws, {
+      event: "docDeleted",
+      data: {
+        time: Date.now(),
+        docId: docId,
+        channelId: channelId,
+        docName: document.name,
+        dir: document.dir,
+        depth: document.depth,
+        message: `문서 '${document.name}'이 삭제되었습니다.`,
+      },
+    });
+
+    console.log(
+      `문서 소프트 삭제: ${document.name} (${docId}) in ${channelId} by ${userId}`,
+    );
+  } catch (error) {
+    logError("DOC_DELETE", error);
+    sendSystemMessage(ws, "문서 삭제 중 오류가 발생했습니다.");
   }
 }
 
