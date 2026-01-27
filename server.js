@@ -375,13 +375,17 @@ wss.on("connection", (ws, req) => {
               await handleQuitChannel(ws, data);
               break;
 
-            // 문서 생성, 삭제
+            // 문서 생성, 삭제, 목록
             case "createDoc":
               await handleCreateDoc(ws, data);
               break;
 
             case "deleteDoc":
               await handleDeleteDoc(ws, data);
+              break;
+
+            case "listDoc":
+              await handleListDoc(ws, data);
               break;
 
             default:
@@ -1078,6 +1082,92 @@ async function handleDeleteDoc(ws, data) {
   } catch (error) {
     logError("DOC_DELETE", error);
     sendSystemMessage(ws, "문서 삭제 중 오류가 발생했습니다.");
+  }
+}
+
+// 문서 목록 조회
+async function handleListDoc(ws, data) {
+  const { channelId } = data;
+  const userId = ws.user.id;
+
+  // 필수값 검증
+  if (!channelId || typeof channelId !== "string") {
+    return sendSystemMessage(ws, "채널 ID를 입력해주세요.");
+  }
+
+  try {
+    // 채널 존재 여부 및 멤버십 확인
+    let channel;
+    try {
+      channel = await prisma.channelData.findFirst({
+        where: { id: channelId, status: 0 },
+        include: {
+          members: {
+            where: { userId: userId, status: 0 },
+            select: { permission: true },
+          },
+        },
+      });
+    } catch (dbError) {
+      logError("DB_CHANNEL_FIND", dbError);
+      return sendSystemMessage(ws, "채널 조회 중 오류가 발생했습니다.");
+    }
+
+    if (!channel) {
+      return sendSystemMessage(ws, "채널이 존재하지 않습니다.");
+    }
+
+    // 멤버십 확인
+    const membership = channel.members[0];
+    if (!membership) {
+      return sendSystemMessage(ws, "해당 채널에 가입되어 있지 않습니다.");
+    }
+
+    // 문서 목록 조회 (삭제되지 않은 문서만)
+    let documents;
+    try {
+      documents = await prisma.documentData.findMany({
+        where: { channelId: channelId, status: 0 },
+        select: {
+          id: true,
+          channelId: true,
+          name: true,
+          dir: true,
+          depth: true,
+          createdAt: true,
+          snapshotVersion: true,
+        },
+        orderBy: [{ dir: "asc" }, { depth: "asc" }, { name: "asc" }],
+      });
+    } catch (dbError) {
+      logError("DB_DOC_LIST", dbError);
+      return sendSystemMessage(
+        ws,
+        "문서 목록 조회 중 데이터베이스 오류가 발생했습니다.",
+      );
+    }
+
+    safeSend(ws, {
+      event: "docList",
+      data: {
+        time: Date.now(),
+        channelId: channelId,
+        documents: documents.map((d) => ({
+          docId: d.id,
+          channelId: d.channelId,
+          name: d.name,
+          dir: d.dir,
+          depth: d.depth,
+          createdAt: d.createdAt.toISOString(),
+          snapshotVersion: d.snapshotVersion,
+        })),
+      },
+    });
+
+    console.log(`문서 목록 조회: ${channelId} by ${userId}`);
+  } catch (error) {
+    logError("DOC_LIST", error);
+    sendSystemMessage(ws, "문서 목록 조회 중 오류가 발생했습니다.");
   }
 }
 
