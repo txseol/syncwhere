@@ -82,6 +82,125 @@ const prisma = new PrismaClient({
   ],
 });
 
+// === 채널/문서별 웹소켓 연결 관리 ===
+// 채널별 연결된 클라이언트: Map<channelId, Set<ws>>
+const channelConnections = new Map();
+// 문서별 연결된 클라이언트: Map<docId, Set<ws>>
+const docConnections = new Map();
+
+// 채널에 웹소켓 추가
+function addToChannel(channelId, ws) {
+  if (!channelConnections.has(channelId)) {
+    channelConnections.set(channelId, new Set());
+  }
+  channelConnections.get(channelId).add(ws);
+  ws.currentChannel = channelId;
+}
+
+// 채널에서 웹소켓 제거
+function removeFromChannel(channelId, ws) {
+  const connections = channelConnections.get(channelId);
+  if (connections) {
+    connections.delete(ws);
+    if (connections.size === 0) {
+      channelConnections.delete(channelId);
+    }
+  }
+  if (ws.currentChannel === channelId) {
+    ws.currentChannel = null;
+  }
+}
+
+// 문서에 웹소켓 추가
+function addToDoc(docId, ws) {
+  if (!docConnections.has(docId)) {
+    docConnections.set(docId, new Set());
+  }
+  docConnections.get(docId).add(ws);
+  ws.currentDoc = docId;
+}
+
+// 문서에서 웹소켓 제거
+function removeFromDoc(docId, ws) {
+  const connections = docConnections.get(docId);
+  if (connections) {
+    connections.delete(ws);
+    if (connections.size === 0) {
+      docConnections.delete(docId);
+    }
+  }
+  if (ws.currentDoc === docId) {
+    ws.currentDoc = null;
+  }
+}
+
+// 채널 내 모든 유저에게 브로드캐스트 (자신 제외 옵션)
+function broadcastToChannel(channelId, event, data, excludeWs = null) {
+  const connections = channelConnections.get(channelId);
+  if (!connections) return 0;
+
+  let sentCount = 0;
+  connections.forEach((ws) => {
+    if (ws !== excludeWs) {
+      if (safeSend(ws, { event, data })) {
+        sentCount++;
+      }
+    }
+  });
+  return sentCount;
+}
+
+// 문서 열람 중인 유저에게 브로드캐스트 (자신 제외 옵션)
+function broadcastToDoc(docId, event, data, excludeWs = null) {
+  const connections = docConnections.get(docId);
+  if (!connections) return 0;
+
+  let sentCount = 0;
+  connections.forEach((ws) => {
+    if (ws !== excludeWs) {
+      if (safeSend(ws, { event, data })) {
+        sentCount++;
+      }
+    }
+  });
+  return sentCount;
+}
+
+// 채널 내 현재 접속 유저 목록 조회
+function getChannelUsers(channelId) {
+  const connections = channelConnections.get(channelId);
+  if (!connections) return [];
+
+  const users = [];
+  connections.forEach((ws) => {
+    if (ws.user) {
+      users.push({
+        id: ws.user.id,
+        email: ws.user.email,
+        currentDoc: ws.currentDoc || null,
+      });
+    }
+  });
+  return users;
+}
+
+// 문서 열람 중인 유저 목록 조회
+function getDocUsers(docId) {
+  const connections = docConnections.get(docId);
+  if (!connections) return [];
+
+  const users = [];
+  connections.forEach((ws) => {
+    if (ws.user) {
+      users.push({
+        id: ws.user.id,
+        email: ws.user.email,
+      });
+    }
+  });
+  return users;
+}
+
 // Prisma 연결 확인
 async function initPrisma() {
   try {
@@ -388,6 +507,39 @@ wss.on("connection", (ws, req) => {
               await handleListDoc(ws, data);
               break;
 
+            // 채널 입장/퇴장 (실시간 연결 관리)
+            case "enterChannel":
+              await handleEnterChannel(ws, data);
+              break;
+
+            case "leaveChannel":
+              await handleLeaveChannel(ws, data);
+              break;
+
+            // 문서 열람 입장/퇴장
+            case "enterDoc":
+              await handleEnterDoc(ws, data);
+              break;
+
+            case "leaveDoc":
+              await handleLeaveDoc(ws, data);
+              break;
+
+            // 문서 수정 (경로, 이름 변경)
+            case "updateDoc":
+              await handleUpdateDoc(ws, data);
+              break;
+
+            // 채널 내 현재 접속 유저 조회
+            case "getChannelUsers":
+              await handleGetChannelUsers(ws, data);
+              break;
+
+            // 문서 열람 중인 유저 조회
+            case "getDocUsers":
+              await handleGetDocUsers(ws, data);
+              break;
+
             default:
               sendErrorResponse(ws, event, `알 수 없는 이벤트: ${event}`);
               break;
@@ -400,6 +552,37 @@ wss.on("connection", (ws, req) => {
 
       ws.on("close", (code, reason) => {
         console.log(`WS 종료: ${user.email} (code: ${code})`);
+
+        // 웹소켓 연결 종료 시 채널/문서에서 정리
+        const userId = ws.user?.id;
+        const channelId = ws.currentChannel;
+        const docId = ws.currentDoc;
+
+        // 문서에서 퇴장 처리
+        if (docId) {
+          removeFromDoc(docId, ws);
+          // 문서 열람 중인 다른 유저들에게 퇴장 알림
+          broadcastToDoc(docId, "userLeftDoc", {
+            time: Date.now(),
+            docId: docId,
+            userId: userId,
+            email: ws.user?.email,
+            reason: "disconnected",
+          });
+        }
+
+        // 채널에서 퇴장 처리
+        if (channelId) {
+          removeFromChannel(channelId, ws);
+          // 채널 내 다른 유저들에게 퇴장 알림
+          broadcastToChannel(channelId, "userLeft", {
+            time: Date.now(),
+            channelId: channelId,
+            userId: userId,
+            email: ws.user?.email,
+            reason: "disconnected",
+          });
+        }
       });
 
       ws.on("error", (error) => {
@@ -838,7 +1021,7 @@ async function handleQuitChannel(ws, data) {
   }
 }
 
-// === 문서 핸들러 (채널 오너만 생성/삭제 가능) ===
+// === 문서 핸들러 ===
 
 // 문서 생성 (LSEQ CRDT 기반)
 async function handleCreateDoc(ws, data) {
@@ -892,10 +1075,7 @@ async function handleCreateDoc(ws, data) {
 
     // 오너(생성자) 권한 확인 (permission: 0 = 오너)
     if (membership.permission !== 0) {
-      return sendSystemMessage(
-        ws,
-        "문서 생성 권한이 없습니다. (채널 오너만 가능)",
-      );
+      return sendSystemMessage(ws, "문서 생성 권한이 없습니다.");
     }
 
     // 같은 경로에 동일한 이름의 문서 존재 여부 확인 (삭제되지 않은 문서만)
@@ -957,6 +1137,23 @@ async function handleCreateDoc(ws, data) {
         "문서 생성 중 데이터베이스 오류가 발생했습니다.",
       );
     }
+
+    // 채널 내 모든 유저에게 문서 생성 알림 (목록 새로고침 트리거)
+    broadcastToChannel(
+      channelId,
+      "docListChanged",
+      {
+        time: Date.now(),
+        channelId: channelId,
+        action: "created",
+        docId: document.id,
+        docName: docName,
+        dir: dir,
+        depth: depth,
+        createdBy: userId,
+      },
+      ws, // 자신에게는 별도로 전송
+    );
 
     safeSend(ws, {
       event: "docCreated",
@@ -1024,10 +1221,7 @@ async function handleDeleteDoc(ws, data) {
 
     // 오너(생성자) 권한 확인
     if (membership.permission !== 0) {
-      return sendSystemMessage(
-        ws,
-        "문서 삭제 권한이 없습니다. (채널 오너만 가능)",
-      );
+      return sendSystemMessage(ws, "문서 삭제 권한이 없습니다.");
     }
 
     // 문서 존재 여부 확인 (삭제되지 않은 문서만)
@@ -1062,6 +1256,32 @@ async function handleDeleteDoc(ws, data) {
         "문서 삭제 중 데이터베이스 오류가 발생했습니다.",
       );
     }
+
+    // 채널 내 모든 유저에게 문서 삭제 알림 (목록 새로고침 트리거)
+    broadcastToChannel(
+      channelId,
+      "docListChanged",
+      {
+        time: Date.now(),
+        channelId: channelId,
+        action: "deleted",
+        docId: docId,
+        docName: document.name,
+        dir: document.dir,
+        depth: document.depth,
+        deletedBy: userId,
+      },
+      ws, // 자신에게는 별도로 전송
+    );
+
+    // 해당 문서를 열람 중인 유저들에게도 알림
+    broadcastToDoc(docId, "docDeleted", {
+      time: Date.now(),
+      docId: docId,
+      docName: document.name,
+      deletedBy: userId,
+      message: `문서 '${document.name}'이 삭제되었습니다.`,
+    });
 
     safeSend(ws, {
       event: "docDeleted",
@@ -1169,6 +1389,629 @@ async function handleListDoc(ws, data) {
     logError("DOC_LIST", error);
     sendSystemMessage(ws, "문서 목록 조회 중 오류가 발생했습니다.");
   }
+}
+
+// === 채널 입장/퇴장 핸들러 (실시간 연결 관리) ===
+
+// 채널 입장 (실시간 연결)
+async function handleEnterChannel(ws, data) {
+  const { channelId } = data;
+  const userId = ws.user.id;
+
+  if (!channelId || typeof channelId !== "string") {
+    return sendSystemMessage(ws, "채널 ID를 입력해주세요.");
+  }
+
+  try {
+    // 이미 다른 채널에 입장한 상태면 먼저 퇴장
+    if (ws.currentChannel && ws.currentChannel !== channelId) {
+      const prevChannelId = ws.currentChannel;
+      removeFromChannel(prevChannelId, ws);
+
+      // 이전 채널 유저들에게 퇴장 알림
+      broadcastToChannel(prevChannelId, "userLeft", {
+        time: Date.now(),
+        channelId: prevChannelId,
+        userId: userId,
+        email: ws.user.email,
+      });
+    }
+
+    // 채널 존재 여부 및 멤버십 확인
+    let channel;
+    try {
+      channel = await prisma.channelData.findFirst({
+        where: { id: channelId, status: 0 },
+        include: {
+          members: {
+            where: { userId: userId, status: 0 },
+            select: { permission: true, joinOrder: true },
+          },
+        },
+      });
+    } catch (dbError) {
+      logError("DB_CHANNEL_FIND", dbError);
+      return sendSystemMessage(ws, "채널 조회 중 오류가 발생했습니다.");
+    }
+
+    if (!channel) {
+      return sendSystemMessage(ws, "채널이 존재하지 않습니다.");
+    }
+
+    // 멤버십 확인
+    const membership = channel.members[0];
+    if (!membership) {
+      return sendSystemMessage(ws, "해당 채널에 가입되어 있지 않습니다.");
+    }
+
+    // 채널에 입장
+    addToChannel(channelId, ws);
+
+    // 채널 내 다른 유저들에게 입장 알림
+    broadcastToChannel(
+      channelId,
+      "userEntered",
+      {
+        time: Date.now(),
+        channelId: channelId,
+        userId: userId,
+        email: ws.user.email,
+      },
+      ws,
+    );
+
+    // 현재 채널 접속 유저 목록
+    const onlineUsers = getChannelUsers(channelId);
+
+    safeSend(ws, {
+      event: "channelEntered",
+      data: {
+        time: Date.now(),
+        channelId: channelId,
+        channelName: channel.name,
+        myPermission: membership.permission,
+        myJoinOrder: membership.joinOrder,
+        onlineUsers: onlineUsers,
+        message: `채널 '${channel.name}'에 입장했습니다.`,
+      },
+    });
+
+    console.log(`채널 입장: ${channel.name} (${channelId}) - ${userId}`);
+  } catch (error) {
+    logError("CHANNEL_ENTER", error);
+    sendSystemMessage(ws, "채널 입장 중 오류가 발생했습니다.");
+  }
+}
+
+// 채널 퇴장 (실시간 연결 해제)
+async function handleLeaveChannel(ws, data) {
+  const { channelId } = data;
+  const userId = ws.user.id;
+
+  // channelId 없으면 현재 채널에서 퇴장
+  const targetChannelId = channelId || ws.currentChannel;
+
+  if (!targetChannelId) {
+    return sendSystemMessage(ws, "퇴장할 채널이 없습니다.");
+  }
+
+  // 문서 열람 중이면 먼저 문서에서 퇴장
+  if (ws.currentDoc) {
+    const docId = ws.currentDoc;
+    removeFromDoc(docId, ws);
+
+    // 문서 열람 유저들에게 퇴장 알림
+    broadcastToDoc(docId, "userLeftDoc", {
+      time: Date.now(),
+      docId: docId,
+      userId: userId,
+      email: ws.user.email,
+    });
+  }
+
+  // 채널에서 퇴장
+  removeFromChannel(targetChannelId, ws);
+
+  // 채널 내 다른 유저들에게 퇴장 알림
+  broadcastToChannel(targetChannelId, "userLeft", {
+    time: Date.now(),
+    channelId: targetChannelId,
+    userId: userId,
+    email: ws.user.email,
+  });
+
+  safeSend(ws, {
+    event: "channelLeft",
+    data: {
+      time: Date.now(),
+      channelId: targetChannelId,
+      message: "채널에서 퇴장했습니다.",
+    },
+  });
+
+  console.log(`채널 퇴장: ${targetChannelId} - ${userId}`);
+}
+
+// === 문서 열람 입장/퇴장 핸들러 ===
+
+// 문서 열람 시작 (입장)
+async function handleEnterDoc(ws, data) {
+  const { channelId, docId } = data;
+  const userId = ws.user.id;
+
+  if (!channelId || typeof channelId !== "string") {
+    return sendSystemMessage(ws, "채널 ID를 입력해주세요.");
+  }
+  if (!docId || typeof docId !== "string") {
+    return sendSystemMessage(ws, "문서 ID를 입력해주세요.");
+  }
+
+  // 채널에 입장하지 않은 상태면 먼저 채널 입장 필요
+  if (ws.currentChannel !== channelId) {
+    return sendSystemMessage(ws, "먼저 해당 채널에 입장해주세요.");
+  }
+
+  try {
+    // 이미 다른 문서를 열람 중이면 먼저 퇴장
+    if (ws.currentDoc && ws.currentDoc !== docId) {
+      const prevDocId = ws.currentDoc;
+      removeFromDoc(prevDocId, ws);
+
+      // 이전 문서 열람 유저들에게 퇴장 알림
+      broadcastToDoc(prevDocId, "userLeftDoc", {
+        time: Date.now(),
+        docId: prevDocId,
+        userId: userId,
+        email: ws.user.email,
+      });
+    }
+
+    // 문서 존재 여부 확인
+    let document;
+    try {
+      document = await prisma.documentData.findFirst({
+        where: {
+          id: docId,
+          channelId: channelId,
+          status: 0,
+        },
+        select: {
+          id: true,
+          name: true,
+          dir: true,
+          depth: true,
+          content: true,
+          snapshotVersion: true,
+        },
+      });
+    } catch (dbError) {
+      logError("DB_DOC_FIND", dbError);
+      return sendSystemMessage(ws, "문서 조회 중 오류가 발생했습니다.");
+    }
+
+    if (!document) {
+      return sendSystemMessage(ws, "문서가 존재하지 않습니다.");
+    }
+
+    // 문서에 입장
+    addToDoc(docId, ws);
+
+    // 문서 열람 중인 다른 유저들에게 입장 알림
+    broadcastToDoc(
+      docId,
+      "userEnteredDoc",
+      {
+        time: Date.now(),
+        docId: docId,
+        userId: userId,
+        email: ws.user.email,
+      },
+      ws,
+    );
+
+    // 채널 내 유저들에게도 상태 변경 알림 (누군가가 문서를 열람 시작함)
+    broadcastToChannel(
+      channelId,
+      "userDocStatusChanged",
+      {
+        time: Date.now(),
+        channelId: channelId,
+        userId: userId,
+        email: ws.user.email,
+        docId: docId,
+        docName: document.name,
+        status: "viewing",
+      },
+      ws,
+    );
+
+    // 현재 문서 열람 유저 목록
+    const viewingUsers = getDocUsers(docId);
+
+    safeSend(ws, {
+      event: "docEntered",
+      data: {
+        time: Date.now(),
+        docId: docId,
+        channelId: channelId,
+        docName: document.name,
+        dir: document.dir,
+        depth: document.depth,
+        content: document.content,
+        snapshotVersion: document.snapshotVersion,
+        viewingUsers: viewingUsers,
+        message: `문서 '${document.name}'을 열람합니다.`,
+      },
+    });
+
+    console.log(`문서 입장: ${document.name} (${docId}) - ${userId}`);
+  } catch (error) {
+    logError("DOC_ENTER", error);
+    sendSystemMessage(ws, "문서 열람 중 오류가 발생했습니다.");
+  }
+}
+
+// 문서 열람 종료 (퇴장)
+async function handleLeaveDoc(ws, data) {
+  const { docId } = data;
+  const userId = ws.user.id;
+
+  // docId 없으면 현재 문서에서 퇴장
+  const targetDocId = docId || ws.currentDoc;
+
+  if (!targetDocId) {
+    return sendSystemMessage(ws, "퇴장할 문서가 없습니다.");
+  }
+
+  const channelId = ws.currentChannel;
+
+  // 문서에서 퇴장
+  removeFromDoc(targetDocId, ws);
+
+  // 문서 열람 중인 다른 유저들에게 퇴장 알림
+  broadcastToDoc(targetDocId, "userLeftDoc", {
+    time: Date.now(),
+    docId: targetDocId,
+    userId: userId,
+    email: ws.user.email,
+  });
+
+  // 채널 내 유저들에게도 상태 변경 알림
+  if (channelId) {
+    broadcastToChannel(
+      channelId,
+      "userDocStatusChanged",
+      {
+        time: Date.now(),
+        channelId: channelId,
+        userId: userId,
+        email: ws.user.email,
+        docId: null,
+        docName: null,
+        status: "idle",
+      },
+      ws,
+    );
+  }
+
+  safeSend(ws, {
+    event: "docLeft",
+    data: {
+      time: Date.now(),
+      docId: targetDocId,
+      message: "문서 열람을 종료했습니다.",
+    },
+  });
+
+  console.log(`문서 퇴장: ${targetDocId} - ${userId}`);
+}
+
+// === 문서 수정 핸들러 (경로, 이름 변경) ===
+
+async function handleUpdateDoc(ws, data) {
+  const { channelId, docId, newName, newDir, newDepth } = data;
+  const userId = ws.user.id;
+
+  // 필수값 검증
+  if (!channelId || typeof channelId !== "string") {
+    return sendSystemMessage(ws, "채널 ID를 입력해주세요.");
+  }
+  if (!docId || typeof docId !== "string") {
+    return sendSystemMessage(ws, "문서 ID를 입력해주세요.");
+  }
+
+  // 수정할 값이 하나도 없으면
+  if (newName === undefined && newDir === undefined && newDepth === undefined) {
+    return sendSystemMessage(ws, "수정할 항목을 입력해주세요.");
+  }
+
+  // 유효성 검증
+  if (newName !== undefined) {
+    if (typeof newName !== "string" || newName.length === 0) {
+      return sendSystemMessage(ws, "문서명이 올바르지 않습니다.");
+    }
+    if (newName.length > 100) {
+      return sendSystemMessage(ws, "문서명은 100자 이하로 입력해주세요.");
+    }
+  }
+  if (newDir !== undefined) {
+    if (typeof newDir !== "string" || newDir.length > 100) {
+      return sendSystemMessage(ws, "디렉토리명이 올바르지 않습니다.");
+    }
+  }
+  if (newDepth !== undefined) {
+    if (typeof newDepth !== "number" || newDepth < 0 || newDepth > 20) {
+      return sendSystemMessage(
+        ws,
+        "디렉토리 깊이가 올바르지 않습니다. (0~20)",
+      );
+    }
+  }
+
+  try {
+    // 채널 존재 여부 및 멤버십 확인
+    let channel;
+    try {
+      channel = await prisma.channelData.findFirst({
+        where: { id: channelId, status: 0 },
+        include: {
+          members: {
+            where: { userId: userId, status: 0 },
+            select: { permission: true },
+          },
+        },
+      });
+    } catch (dbError) {
+      logError("DB_CHANNEL_FIND", dbError);
+      return sendSystemMessage(ws, "채널 조회 중 오류가 발생했습니다.");
+    }
+
+    if (!channel) {
+      return sendSystemMessage(ws, "채널이 존재하지 않습니다.");
+    }
+
+    // 멤버십 확인
+    const membership = channel.members[0];
+    if (!membership) {
+      return sendSystemMessage(ws, "해당 채널에 가입되어 있지 않습니다.");
+    }
+
+    // 오너(생성자) 권한 확인
+    if (membership.permission !== 0) {
+      return sendSystemMessage(ws, "문서 수정 권한이 없습니다.");
+    }
+
+    // 문서 존재 여부 확인
+    let document;
+    try {
+      document = await prisma.documentData.findFirst({
+        where: {
+          id: docId,
+          channelId: channelId,
+          status: 0,
+        },
+      });
+    } catch (dbError) {
+      logError("DB_DOC_FIND", dbError);
+      return sendSystemMessage(ws, "문서 조회 중 오류가 발생했습니다.");
+    }
+
+    if (!document) {
+      return sendSystemMessage(ws, "문서가 존재하지 않습니다.");
+    }
+
+    // 최종 경로 계산 (변경되지 않는 값은 기존값 유지)
+    const finalName = newName !== undefined ? newName : document.name;
+    const finalDir = newDir !== undefined ? newDir : document.dir;
+    const finalDepth = newDepth !== undefined ? newDepth : document.depth;
+
+    // 경로/이름이 변경되는 경우 중복 체크
+    if (
+      finalName !== document.name ||
+      finalDir !== document.dir ||
+      finalDepth !== document.depth
+    ) {
+      let existingDoc;
+      try {
+        existingDoc = await prisma.documentData.findFirst({
+          where: {
+            channelId: channelId,
+            name: finalName,
+            dir: finalDir,
+            depth: finalDepth,
+            status: 0,
+            NOT: { id: docId }, // 자기 자신 제외
+          },
+        });
+      } catch (dbError) {
+        logError("DB_DOC_FIND_DUP", dbError);
+        return sendSystemMessage(ws, "문서 중복 확인 중 오류가 발생했습니다.");
+      }
+
+      if (existingDoc) {
+        return sendSystemMessage(
+          ws,
+          `해당 경로에 '${finalName}' 이름의 문서가 이미 존재합니다.`,
+        );
+      }
+    }
+
+    // 문서 업데이트
+    let updatedDoc;
+    try {
+      updatedDoc = await prisma.documentData.update({
+        where: { id: docId },
+        data: {
+          name: finalName,
+          dir: finalDir,
+          depth: finalDepth,
+        },
+      });
+    } catch (dbError) {
+      logError("DB_DOC_UPDATE", dbError);
+      if (dbError.code === "P2002") {
+        return sendSystemMessage(
+          ws,
+          `해당 경로에 '${finalName}' 이름의 문서가 이미 존재합니다.`,
+        );
+      }
+      return sendSystemMessage(
+        ws,
+        "문서 수정 중 데이터베이스 오류가 발생했습니다.",
+      );
+    }
+
+    // 변경 내용 구성
+    const changes = {};
+    if (newName !== undefined && newName !== document.name) {
+      changes.name = { from: document.name, to: newName };
+    }
+    if (newDir !== undefined && newDir !== document.dir) {
+      changes.dir = { from: document.dir, to: newDir };
+    }
+    if (newDepth !== undefined && newDepth !== document.depth) {
+      changes.depth = { from: document.depth, to: newDepth };
+    }
+
+    // 채널 내 모든 유저에게 문서 변경 알림 (목록 새로고침 트리거)
+    broadcastToChannel(
+      channelId,
+      "docUpdated",
+      {
+        time: Date.now(),
+        docId: docId,
+        channelId: channelId,
+        oldName: document.name,
+        oldDir: document.dir,
+        oldDepth: document.depth,
+        newName: finalName,
+        newDir: finalDir,
+        newDepth: finalDepth,
+        changes: changes,
+        updatedBy: userId,
+      },
+      ws, // 자신에게는 별도로 전송
+    );
+
+    // 문서 열람 중인 유저들에게도 알림
+    broadcastToDoc(
+      docId,
+      "docInfoChanged",
+      {
+        time: Date.now(),
+        docId: docId,
+        newName: finalName,
+        newDir: finalDir,
+        newDepth: finalDepth,
+        changes: changes,
+      },
+      ws,
+    );
+
+    safeSend(ws, {
+      event: "docUpdated",
+      data: {
+        time: Date.now(),
+        docId: docId,
+        channelId: channelId,
+        oldName: document.name,
+        oldDir: document.dir,
+        oldDepth: document.depth,
+        newName: finalName,
+        newDir: finalDir,
+        newDepth: finalDepth,
+        changes: changes,
+        message: `문서가 수정되었습니다.`,
+      },
+    });
+
+    console.log(
+      `문서 수정: ${document.name} → ${finalName} (${docId}) in ${channelId} by ${userId}`,
+    );
+  } catch (error) {
+    logError("DOC_UPDATE", error);
+    sendSystemMessage(ws, "문서 수정 중 오류가 발생했습니다.");
+  }
+}
+
+// === 채널/문서 유저 조회 핸들러 ===
+
+// 채널 내 현재 접속 유저 조회
+async function handleGetChannelUsers(ws, data) {
+  const { channelId } = data;
+  const userId = ws.user.id;
+
+  // channelId 없으면 현재 채널
+  const targetChannelId = channelId || ws.currentChannel;
+
+  if (!targetChannelId) {
+    return sendSystemMessage(ws, "채널 ID를 입력해주세요.");
+  }
+
+  try {
+    // 멤버십 확인
+    let membership;
+    try {
+      membership = await prisma.channelMember.findUnique({
+        where: {
+          channelId_userId: {
+            channelId: targetChannelId,
+            userId: userId,
+          },
+        },
+      });
+    } catch (dbError) {
+      logError("DB_MEMBER_FIND", dbError);
+      return sendSystemMessage(ws, "멤버 조회 중 오류가 발생했습니다.");
+    }
+
+    if (!membership || membership.status !== 0) {
+      return sendSystemMessage(ws, "해당 채널에 가입되어 있지 않습니다.");
+    }
+
+    const onlineUsers = getChannelUsers(targetChannelId);
+
+    safeSend(ws, {
+      event: "channelUsers",
+      data: {
+        time: Date.now(),
+        channelId: targetChannelId,
+        users: onlineUsers,
+      },
+    });
+  } catch (error) {
+    logError("GET_CHANNEL_USERS", error);
+    sendSystemMessage(ws, "유저 목록 조회 중 오류가 발생했습니다.");
+  }
+}
+
+// 문서 열람 중인 유저 조회
+async function handleGetDocUsers(ws, data) {
+  const { docId } = data;
+  const userId = ws.user.id;
+
+  // docId 없으면 현재 문서
+  const targetDocId = docId || ws.currentDoc;
+
+  if (!targetDocId) {
+    return sendSystemMessage(ws, "문서 ID를 입력해주세요.");
+  }
+
+  // 채널 입장 상태 확인
+  if (!ws.currentChannel) {
+    return sendSystemMessage(ws, "먼저 채널에 입장해주세요.");
+  }
+
+  const viewingUsers = getDocUsers(targetDocId);
+
+  safeSend(ws, {
+    event: "docUsers",
+    data: {
+      time: Date.now(),
+      docId: targetDocId,
+      users: viewingUsers,
+    },
+  });
 }
 
 // === 서버 시작 ===
