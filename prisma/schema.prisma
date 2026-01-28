@@ -82,7 +82,8 @@ model DocumentData {
   channelId       String      @map("channel_id") @db.Uuid
   name            String
   content         String      @default("")
-  logMetadata     Json        @default("[]") @map("log_metadata")
+  charsData       Json        @default("[]") @map("chars_data") // LSEQ chars 배열 [{id, char}, ...]
+  logMetadata     Json        @default("[]") @map("log_metadata") // 편집 로그 (스냅샷 시 초기화)
   snapshotVersion String      @default("1.0.0") @map("snapshot_version") @db.VarChar(20)
   lastSnapshotAt  DateTime    @default(now()) @map("last_snapshot_at") @db.Timestamptz(6)
   permission      Int         @default(0)

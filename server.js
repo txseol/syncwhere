@@ -655,11 +655,18 @@ async function syncDocToSupabase(docId) {
 
     // 버전 비교: Redis > Supabase인 경우에만 동기화
     if (compareVersion(cachedDoc.snapshotVersion, dbDoc.snapshotVersion) > 0) {
+      // chars 배열에서 순수 데이터만 추출 (id, char만)
+      const charsToSave = (cachedDoc.chars || []).map((c) => ({
+        id: c.id,
+        char: c.char,
+      }));
+
       await prisma.documentData.update({
         where: { id: docId },
         data: {
           content: cachedDoc.content,
-          logMetadata: cachedDoc.logMetadata,
+          charsData: charsToSave, // chars 배열 저장
+          logMetadata: cachedDoc.logMetadata || [],
           snapshotVersion: cachedDoc.snapshotVersion,
         },
       });
@@ -687,6 +694,7 @@ async function loadDocToCache(docId) {
         channelId: true,
         name: true,
         content: true,
+        charsData: true, // LSEQ chars 배열
         logMetadata: true,
         snapshotVersion: true,
         status: true,
@@ -700,20 +708,29 @@ async function loadDocToCache(docId) {
 
     if (!doc) return null;
 
-    // logMetadata에서 chars 배열 복원 또는 content에서 생성
+    // chars 배열 복원
     let chars = [];
 
-    // logMetadata가 chars 형태인지 확인 (스냅샷 후 저장된 경우)
+    // 1순위: charsData 컬럼에서 복원
     if (
+      Array.isArray(doc.charsData) &&
+      doc.charsData.length > 0 &&
+      doc.charsData[0]?.id &&
+      doc.charsData[0]?.char
+    ) {
+      chars = doc.charsData;
+    }
+    // 2순위: 구버전 호환 - logMetadata에서 복원 (마이그레이션 전 데이터)
+    else if (
       Array.isArray(doc.logMetadata) &&
       doc.logMetadata.length > 0 &&
       doc.logMetadata[0]?.id &&
       doc.logMetadata[0]?.char
     ) {
-      // 이미 chars 형태로 저장됨 (스냅샷 데이터)
       chars = doc.logMetadata;
-    } else if (doc.content && doc.content.length > 0) {
-      // content에서 chars 생성 (마이그레이션 또는 초기 로드)
+    }
+    // 3순위: content에서 chars 생성 (마이그레이션 또는 초기 로드)
+    else if (doc.content && doc.content.length > 0) {
       // 기존 content는 ID가 없으므로 새로 생성
       let lastId = null;
       for (const char of doc.content) {
@@ -780,12 +797,13 @@ async function createSnapshot(docId) {
       cachedDoc.snapshotVersion,
     );
 
-    // 4. Supabase 업데이트 (logMetadata에 chars 저장, 로그 정보 제거)
+    // 4. Supabase 업데이트 (charsData에 chars 저장, 로그 초기화)
     const updated = await prisma.documentData.update({
       where: { id: docId },
       data: {
         content: content,
-        logMetadata: snapshotChars, // chars 배열 저장 (id, char만)
+        charsData: snapshotChars, // chars 배열 저장 (id, char만)
+        logMetadata: [], // 로그 초기화
         snapshotVersion: newSnapshotVersion,
         lastSnapshotAt: new Date(),
       },
@@ -1177,9 +1195,14 @@ wss.on("connection", (ws, req) => {
               break;
 
             // === 문서 편집 관련 이벤트 ===
-            // 문서 편집 (CRDT 로그 추가)
+            // 문서 편집 (LSEQ - 단일 문자)
             case "editDoc":
               await handleEditDoc(ws, data);
+              break;
+
+            // 문서 편집 (LSEQ - 여러 문자 batch)
+            case "editDocBatch":
+              await handleEditDocBatch(ws, data);
               break;
 
             // 문서 동기화 요청 (오너만)
@@ -2777,6 +2800,101 @@ async function handleEditDoc(ws, data) {
     }
   } catch (error) {
     logError("DOC_EDIT_LSEQ", error);
+    sendSystemMessage(ws, "문서 편집 중 오류가 발생했습니다.");
+  }
+}
+
+// === LSEQ Batch 편집 핸들러 (여러 문자 동시 처리) ===
+// 클라이언트가 여러 문자를 한 번에 삽입/삭제할 때 사용
+// operations: [{ intent: "insert", leftId, rightId, value }, { intent: "delete", id }, ...]
+async function handleEditDocBatch(ws, data) {
+  const { docId, operations } = data;
+  const userId = ws.user.id;
+
+  // 필수값 검증
+  if (!docId || typeof docId !== "string") {
+    return sendSystemMessage(ws, "문서 ID를 입력해주세요.");
+  }
+  if (!Array.isArray(operations) || operations.length === 0) {
+    return sendSystemMessage(ws, "편집 작업 목록이 필요합니다.");
+  }
+  if (operations.length > 1000) {
+    return sendSystemMessage(ws, "한 번에 최대 1000개까지만 처리할 수 있습니다.");
+  }
+
+  // 현재 문서를 열람 중인지 확인
+  if (ws.currentDoc !== docId) {
+    return sendSystemMessage(ws, "해당 문서를 열람하고 있지 않습니다.");
+  }
+
+  try {
+    // 문서 편집 가능 상태 확인
+    const editable = await isDocEditable(docId);
+    if (!editable) {
+      return safeSend(ws, {
+        event: "editRejected",
+        data: {
+          time: Date.now(),
+          docId: docId,
+          reason: "문서가 잠겨있어 편집할 수 없습니다.",
+        },
+      });
+    }
+
+    const results = [];
+    let lastVersion = null;
+
+    for (const op of operations) {
+      const { intent, leftId, rightId, id, value } = op;
+
+      if (intent === "insert") {
+        // INSERT 작업
+        if (typeof value !== "string" || value.length !== 1) {
+          continue; // 잘못된 형식은 스킵
+        }
+
+        const result = await insertCharToDoc(docId, leftId || null, rightId || null, value, userId);
+        if (result) {
+          results.push({
+            op: "insert",
+            id: result.newId,
+            char: value,
+          });
+          lastVersion = result.newVersion;
+        }
+      } else if (intent === "delete") {
+        // DELETE 작업
+        if (!id || typeof id !== "string") {
+          continue; // 잘못된 형식은 스킵
+        }
+
+        const result = await deleteCharFromDoc(docId, id, userId);
+        if (result && !result.alreadyDeleted) {
+          results.push({
+            op: "delete",
+            id: id,
+          });
+          lastVersion = result.newVersion;
+        }
+      }
+    }
+
+    if (results.length === 0) {
+      return sendSystemMessage(ws, "처리된 작업이 없습니다.");
+    }
+
+    // 모든 문서 열람자에게 브로드캐스트 (자신 포함)
+    broadcastToDoc(docId, "docOpBatch", {
+      time: Date.now(),
+      docId: docId,
+      operations: results,
+      editedBy: userId,
+      logVersion: lastVersion,
+    });
+
+    console.log(`LSEQ Batch: ${docId} ${results.length}개 작업 by ${userId}`);
+  } catch (error) {
+    logError("DOC_EDIT_BATCH", error);
     sendSystemMessage(ws, "문서 편집 중 오류가 발생했습니다.");
   }
 }
