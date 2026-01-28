@@ -74,6 +74,62 @@ async function generateUniqueId(model, maxRetries = 5) {
   return generateUUID();
 }
 
+// === 문서 버전 유틸리티 (서비스버전.스냅샷버전.로그버전) ===
+const SERVICE_VERSION = "1"; // 현재 서비스 버전
+
+// 버전 문자열 파싱 (예: "1.2.3" → { service: 1, snapshot: 2, log: 3 })
+function parseVersion(versionStr) {
+  const parts = (versionStr || "1.0.0").split(".");
+  return {
+    service: parseInt(parts[0]) || 1,
+    snapshot: parseInt(parts[1]) || 0,
+    log: parseInt(parts[2]) || 0,
+  };
+}
+
+// 버전 객체를 문자열로 변환
+function stringifyVersion(versionObj) {
+  return `${versionObj.service}.${versionObj.snapshot}.${versionObj.log}`;
+}
+
+// 버전 비교 (-1: a < b, 0: a == b, 1: a > b)
+function compareVersion(a, b) {
+  const vA = typeof a === "string" ? parseVersion(a) : a;
+  const vB = typeof b === "string" ? parseVersion(b) : b;
+
+  if (vA.service !== vB.service) return vA.service > vB.service ? 1 : -1;
+  if (vA.snapshot !== vB.snapshot) return vA.snapshot > vB.snapshot ? 1 : -1;
+  if (vA.log !== vB.log) return vA.log > vB.log ? 1 : -1;
+  return 0;
+}
+
+// 로그 버전 증가
+function incrementLogVersion(versionStr) {
+  const v = parseVersion(versionStr);
+  v.log += 1;
+  return stringifyVersion(v);
+}
+
+// 스냅샷 버전 증가 (로그 버전 리셋)
+function incrementSnapshotVersion(versionStr) {
+  const v = parseVersion(versionStr);
+  v.snapshot += 1;
+  v.log = 0;
+  return stringifyVersion(v);
+}
+
+// 초기 버전 생성
+function createInitialVersion() {
+  return `${SERVICE_VERSION}.0.0`;
+}
+
+// === 문서 상태 상수 ===
+const DOC_STATUS = {
+  NORMAL: 0, // 정상 (작업 가능)
+  DELETED: 1, // 삭제됨
+  LOCKED: 2, // 작업 중 (입력 불가능)
+};
+
 // === Prisma 초기화 ===
 const prisma = new PrismaClient({
   log: [
@@ -199,6 +255,292 @@ function getDocUsers(docId) {
     }
   });
   return users;
+}
+
+// 문서 열람 인원 수 조회
+function getDocUserCount(docId) {
+  const connections = docConnections.get(docId);
+  return connections ? connections.size : 0;
+}
+
+// === Redis 문서 캐시 함수 ===
+const DOC_CACHE_PREFIX = "doc:";
+const DOC_CACHE_TTL = 60 * 60 * 24; // 24시간
+
+// Redis 문서 캐시 키 생성
+function getDocCacheKey(docId) {
+  return `${DOC_CACHE_PREFIX}${docId}`;
+}
+
+// Redis에서 문서 캐시 조회
+async function getDocFromCache(docId) {
+  return await safeRedis(async () => {
+    const key = getDocCacheKey(docId);
+    const data = await redis.get(key);
+    if (!data) return null;
+    try {
+      return JSON.parse(data);
+    } catch (e) {
+      logError("DOC_CACHE_PARSE", e);
+      return null;
+    }
+  }, null);
+}
+
+// Redis에 문서 캐시 저장
+async function setDocToCache(docId, docData) {
+  return await safeRedis(async () => {
+    const key = getDocCacheKey(docId);
+    await redis.set(key, JSON.stringify(docData), { EX: DOC_CACHE_TTL });
+    return true;
+  }, false);
+}
+
+// Redis 문서 캐시 삭제
+async function deleteDocFromCache(docId) {
+  return await safeRedis(async () => {
+    const key = getDocCacheKey(docId);
+    await redis.del(key);
+    return true;
+  }, false);
+}
+
+// Redis 문서 캐시 업데이트 (부분 업데이트)
+async function updateDocCache(docId, updates) {
+  return await safeRedis(async () => {
+    const existing = await getDocFromCache(docId);
+    if (!existing) return false;
+
+    const updated = { ...existing, ...updates };
+    await setDocToCache(docId, updated);
+    return true;
+  }, false);
+}
+
+// Redis 문서에 로그 추가 (CRDT 편집 로그)
+async function appendDocLog(docId, logEntry) {
+  return await safeRedis(async () => {
+    const doc = await getDocFromCache(docId);
+    if (!doc) return null;
+
+    // 로그 추가
+    const logs = doc.logMetadata || [];
+    logs.push(logEntry);
+
+    // 버전 증가
+    const newVersion = incrementLogVersion(doc.snapshotVersion);
+
+    const updated = {
+      ...doc,
+      logMetadata: logs,
+      snapshotVersion: newVersion,
+      updatedAt: new Date().toISOString(),
+    };
+
+    await setDocToCache(docId, updated);
+    return { newVersion, logEntry };
+  }, null);
+}
+
+// === 문서 상태 관리 함수 ===
+
+// 문서 상태 변경 및 전파
+async function setDocStatus(docId, status, broadcastMsg = null) {
+  // Redis 캐시 업데이트
+  const updated = await updateDocCache(docId, { status });
+
+  // 문서 열람 중인 유저들에게 상태 변경 알림
+  broadcastToDoc(docId, "docStatusChanged", {
+    time: Date.now(),
+    docId: docId,
+    status: status,
+    statusText:
+      status === DOC_STATUS.NORMAL
+        ? "normal"
+        : status === DOC_STATUS.DELETED
+          ? "deleted"
+          : "locked",
+    message: broadcastMsg,
+  });
+
+  return updated;
+}
+
+// 문서 잠금 (편집 불가)
+async function lockDoc(docId, reason = "동기화 작업 중입니다.") {
+  console.log(`문서 잠금: ${docId}`);
+  return await setDocStatus(docId, DOC_STATUS.LOCKED, reason);
+}
+
+// 문서 잠금 해제 (편집 가능)
+async function unlockDoc(docId) {
+  console.log(`문서 잠금 해제: ${docId}`);
+  return await setDocStatus(docId, DOC_STATUS.NORMAL, "편집이 가능합니다.");
+}
+
+// 문서가 편집 가능한 상태인지 확인
+async function isDocEditable(docId) {
+  const doc = await getDocFromCache(docId);
+  if (!doc) return false;
+  return doc.status === DOC_STATUS.NORMAL;
+}
+
+// === Redis → Supabase 동기화 함수 ===
+
+// Redis 캐시를 Supabase로 동기화
+async function syncDocToSupabase(docId) {
+  const cachedDoc = await getDocFromCache(docId);
+  if (!cachedDoc) {
+    console.log(`동기화 스킵 (캐시 없음): ${docId}`);
+    return false;
+  }
+
+  try {
+    // Supabase 문서 조회
+    const dbDoc = await prisma.documentData.findUnique({
+      where: { id: docId },
+      select: { snapshotVersion: true, status: true },
+    });
+
+    if (!dbDoc) {
+      console.log(`동기화 스킵 (DB 문서 없음): ${docId}`);
+      return false;
+    }
+
+    // 삭제된 문서는 동기화하지 않음
+    if (dbDoc.status === DOC_STATUS.DELETED) {
+      console.log(`동기화 스킵 (삭제된 문서): ${docId}`);
+      await deleteDocFromCache(docId);
+      return false;
+    }
+
+    // 버전 비교: Redis > Supabase인 경우에만 동기화
+    if (compareVersion(cachedDoc.snapshotVersion, dbDoc.snapshotVersion) > 0) {
+      await prisma.documentData.update({
+        where: { id: docId },
+        data: {
+          content: cachedDoc.content,
+          logMetadata: cachedDoc.logMetadata,
+          snapshotVersion: cachedDoc.snapshotVersion,
+        },
+      });
+      console.log(
+        `문서 동기화 완료: ${docId} (${dbDoc.snapshotVersion} → ${cachedDoc.snapshotVersion})`,
+      );
+      return true;
+    }
+
+    console.log(`동기화 스킵 (버전 동일/낮음): ${docId}`);
+    return false;
+  } catch (error) {
+    logError("DOC_SYNC", error);
+    return false;
+  }
+}
+
+// Supabase에서 문서를 Redis 캐시로 로드
+async function loadDocToCache(docId) {
+  try {
+    const doc = await prisma.documentData.findUnique({
+      where: { id: docId },
+      select: {
+        id: true,
+        channelId: true,
+        name: true,
+        content: true,
+        logMetadata: true,
+        snapshotVersion: true,
+        status: true,
+        dir: true,
+        depth: true,
+        createdBy: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+
+    if (!doc) return null;
+
+    const cacheData = {
+      ...doc,
+      createdAt: doc.createdAt.toISOString(),
+      updatedAt: doc.updatedAt.toISOString(),
+    };
+
+    await setDocToCache(docId, cacheData);
+    console.log(`문서 캐시 로드: ${docId}`);
+    return cacheData;
+  } catch (error) {
+    logError("DOC_CACHE_LOAD", error);
+    return null;
+  }
+}
+
+// 문서 연결 해제 시 동기화 체크 (마지막 유저 퇴장 시)
+async function onDocDisconnect(docId) {
+  const remainingUsers = getDocUserCount(docId);
+
+  if (remainingUsers === 0) {
+    console.log(`마지막 유저 퇴장, 동기화 시작: ${docId}`);
+    await syncDocToSupabase(docId);
+  }
+}
+
+// === 스냅샷 생성 함수 ===
+
+// 로그를 스냅샷으로 병합하고 새 버전 생성
+async function createSnapshot(docId) {
+  try {
+    // 1. Redis 캐시를 먼저 Supabase로 동기화
+    await syncDocToSupabase(docId);
+
+    // 2. Supabase에서 문서 조회
+    const doc = await prisma.documentData.findUnique({
+      where: { id: docId },
+    });
+
+    if (!doc) {
+      throw new Error("문서가 존재하지 않습니다.");
+    }
+
+    // 3. 로그를 content에 적용 (실제 CRDT 병합 로직)
+    // 현재는 content가 이미 최신 상태라고 가정 (로그는 변경 이력용)
+    const newSnapshotVersion = incrementSnapshotVersion(doc.snapshotVersion);
+
+    // 4. Supabase 업데이트 (로그 비우고 스냅샷 버전 증가)
+    const updated = await prisma.documentData.update({
+      where: { id: docId },
+      data: {
+        logMetadata: [], // 로그 초기화
+        snapshotVersion: newSnapshotVersion,
+        lastSnapshotAt: new Date(),
+      },
+    });
+
+    // 5. Redis 캐시 갱신
+    const cacheData = {
+      id: updated.id,
+      channelId: updated.channelId,
+      name: updated.name,
+      content: updated.content,
+      logMetadata: [],
+      snapshotVersion: newSnapshotVersion,
+      status: updated.status,
+      dir: updated.dir,
+      depth: updated.depth,
+      createdBy: updated.createdBy,
+      createdAt: updated.createdAt.toISOString(),
+      updatedAt: updated.updatedAt.toISOString(),
+    };
+
+    await setDocToCache(docId, cacheData);
+
+    console.log(`스냅샷 생성 완료: ${docId} (v${newSnapshotVersion})`);
+    return { snapshotVersion: newSnapshotVersion, doc: cacheData };
+  } catch (error) {
+    logError("CREATE_SNAPSHOT", error);
+    throw error;
+  }
 }
 
 // Prisma 연결 확인
@@ -540,6 +882,27 @@ wss.on("connection", (ws, req) => {
               await handleGetDocUsers(ws, data);
               break;
 
+            // === 문서 편집 관련 이벤트 ===
+            // 문서 편집 (CRDT 로그 추가)
+            case "editDoc":
+              await handleEditDoc(ws, data);
+              break;
+
+            // 문서 동기화 요청 (오너만)
+            case "syncDoc":
+              await handleSyncDoc(ws, data);
+              break;
+
+            // 스냅샷 생성 요청 (오너만)
+            case "snapshotDoc":
+              await handleSnapshotDoc(ws, data);
+              break;
+
+            // 문서 상태 조회
+            case "getDocStatus":
+              await handleGetDocStatus(ws, data);
+              break;
+
             default:
               sendErrorResponse(ws, event, `알 수 없는 이벤트: ${event}`);
               break;
@@ -569,6 +932,9 @@ wss.on("connection", (ws, req) => {
             email: ws.user?.email,
             reason: "disconnected",
           });
+
+          // 마지막 유저 퇴장 시 동기화 체크
+          onDocDisconnect(docId);
         }
 
         // 채널에서 퇴장 처리
@@ -1105,6 +1471,9 @@ async function handleCreateDoc(ws, data) {
     // UUID 중복 방지
     const docId = await generateUniqueId("documentData");
 
+    // 초기 버전 생성
+    const initialVersion = createInitialVersion();
+
     // 문서 생성 (LSEQ CRDT 초기 상태)
     let document;
     try {
@@ -1117,9 +1486,9 @@ async function handleCreateDoc(ws, data) {
           depth: depth,
           content: "", // 초기 본문 비어있음
           logMetadata: [], // 초기 로그 비어있음 (LSEQ 편집 기록용)
-          snapshotVersion: 0,
+          snapshotVersion: initialVersion, // "1.0.0" 형식
           permission: 0, // 채널 멤버 전체 편집 가능
-          status: 0,
+          status: DOC_STATUS.NORMAL,
           createdBy: userId,
         },
       });
@@ -1564,33 +1933,26 @@ async function handleEnterDoc(ws, data) {
         userId: userId,
         email: ws.user.email,
       });
+
+      // 마지막 유저 퇴장 시 동기화 체크
+      onDocDisconnect(prevDocId);
     }
 
-    // 문서 존재 여부 확인
-    let document;
-    try {
-      document = await prisma.documentData.findFirst({
-        where: {
-          id: docId,
-          channelId: channelId,
-          status: 0,
-        },
-        select: {
-          id: true,
-          name: true,
-          dir: true,
-          depth: true,
-          content: true,
-          snapshotVersion: true,
-        },
-      });
-    } catch (dbError) {
-      logError("DB_DOC_FIND", dbError);
-      return sendSystemMessage(ws, "문서 조회 중 오류가 발생했습니다.");
-    }
+    // Redis 캐시에서 문서 조회 (없으면 DB에서 로드)
+    let document = await getDocFromCache(docId);
 
     if (!document) {
+      // DB에서 문서 조회 후 캐시에 로드
+      document = await loadDocToCache(docId);
+    }
+
+    // 문서가 없거나 채널 불일치 또는 삭제된 경우
+    if (!document || document.channelId !== channelId) {
       return sendSystemMessage(ws, "문서가 존재하지 않습니다.");
+    }
+
+    if (document.status === DOC_STATUS.DELETED) {
+      return sendSystemMessage(ws, "삭제된 문서입니다.");
     }
 
     // 문서에 입장
@@ -1638,7 +2000,15 @@ async function handleEnterDoc(ws, data) {
         dir: document.dir,
         depth: document.depth,
         content: document.content,
+        logMetadata: document.logMetadata || [],
         snapshotVersion: document.snapshotVersion,
+        status: document.status,
+        statusText:
+          document.status === DOC_STATUS.NORMAL
+            ? "normal"
+            : document.status === DOC_STATUS.DELETED
+              ? "deleted"
+              : "locked",
         viewingUsers: viewingUsers,
         message: `문서 '${document.name}'을 열람합니다.`,
       },
@@ -1702,6 +2072,9 @@ async function handleLeaveDoc(ws, data) {
       message: "문서 열람을 종료했습니다.",
     },
   });
+
+  // 마지막 유저 퇴장 시 동기화 체크
+  onDocDisconnect(targetDocId);
 
   console.log(`문서 퇴장: ${targetDocId} - ${userId}`);
 }
@@ -2010,6 +2383,319 @@ async function handleGetDocUsers(ws, data) {
       time: Date.now(),
       docId: targetDocId,
       users: viewingUsers,
+    },
+  });
+}
+
+// === 문서 편집 핸들러 (CRDT 로그 추가) ===
+
+async function handleEditDoc(ws, data) {
+  const { docId, operation } = data;
+  const userId = ws.user.id;
+
+  // 필수값 검증
+  if (!docId || typeof docId !== "string") {
+    return sendSystemMessage(ws, "문서 ID를 입력해주세요.");
+  }
+  if (!operation || typeof operation !== "object") {
+    return sendSystemMessage(ws, "편집 작업 정보가 필요합니다.");
+  }
+
+  // 현재 문서를 열람 중인지 확인
+  if (ws.currentDoc !== docId) {
+    return sendSystemMessage(ws, "해당 문서를 열람하고 있지 않습니다.");
+  }
+
+  try {
+    // 문서 편집 가능 상태 확인
+    const editable = await isDocEditable(docId);
+    if (!editable) {
+      return safeSend(ws, {
+        event: "editRejected",
+        data: {
+          time: Date.now(),
+          docId: docId,
+          reason: "문서가 잠겨있어 편집할 수 없습니다.",
+        },
+      });
+    }
+
+    // CRDT 로그 엔트리 생성
+    const logEntry = {
+      id: generateUUID(),
+      userId: userId,
+      timestamp: Date.now(),
+      operation: operation, // { type: 'insert'|'delete', position: [...], char: '...', ... }
+    };
+
+    // Redis 캐시에 로그 추가
+    const result = await appendDocLog(docId, logEntry);
+
+    if (!result) {
+      return sendSystemMessage(ws, "편집 저장에 실패했습니다.");
+    }
+
+    // 동일 문서를 열람 중인 다른 유저들에게 편집 내용 전파
+    broadcastToDoc(
+      docId,
+      "docEdited",
+      {
+        time: Date.now(),
+        docId: docId,
+        logEntry: logEntry,
+        newVersion: result.newVersion,
+        editedBy: userId,
+      },
+      ws, // 자신 제외
+    );
+
+    // 편집자에게 확인 응답
+    safeSend(ws, {
+      event: "editConfirmed",
+      data: {
+        time: Date.now(),
+        docId: docId,
+        logEntryId: logEntry.id,
+        newVersion: result.newVersion,
+      },
+    });
+
+    console.log(`문서 편집: ${docId} by ${userId} (v${result.newVersion})`);
+  } catch (error) {
+    logError("DOC_EDIT", error);
+    sendSystemMessage(ws, "문서 편집 중 오류가 발생했습니다.");
+  }
+}
+
+// === 문서 동기화 핸들러 (오너만 - Redis → Supabase) ===
+
+async function handleSyncDoc(ws, data) {
+  const { channelId, docId } = data;
+  const userId = ws.user.id;
+
+  // 필수값 검증
+  if (!channelId || typeof channelId !== "string") {
+    return sendSystemMessage(ws, "채널 ID를 입력해주세요.");
+  }
+  if (!docId || typeof docId !== "string") {
+    return sendSystemMessage(ws, "문서 ID를 입력해주세요.");
+  }
+
+  try {
+    // 채널 멤버십 및 권한 확인
+    let membership;
+    try {
+      membership = await prisma.channelMember.findUnique({
+        where: {
+          channelId_userId: {
+            channelId: channelId,
+            userId: userId,
+          },
+        },
+      });
+    } catch (dbError) {
+      logError("DB_MEMBER_FIND", dbError);
+      return sendSystemMessage(ws, "권한 확인 중 오류가 발생했습니다.");
+    }
+
+    if (!membership || membership.status !== 0) {
+      return sendSystemMessage(ws, "해당 채널에 가입되어 있지 않습니다.");
+    }
+
+    // 오너 권한 확인 (permission: 0)
+    if (membership.permission !== 0) {
+      return sendSystemMessage(ws, "동기화 권한이 없습니다. (오너만 가능)");
+    }
+
+    // 문서 존재 확인
+    const doc = await getDocFromCache(docId);
+    if (!doc || doc.channelId !== channelId) {
+      return sendSystemMessage(ws, "문서가 존재하지 않습니다.");
+    }
+
+    // 1. 문서 잠금
+    await lockDoc(docId, "동기화 작업 중입니다.");
+
+    // 2. Supabase로 동기화
+    const synced = await syncDocToSupabase(docId);
+
+    // 3. 문서 잠금 해제
+    await unlockDoc(docId);
+
+    // 동기화 결과 전송
+    safeSend(ws, {
+      event: "docSynced",
+      data: {
+        time: Date.now(),
+        docId: docId,
+        channelId: channelId,
+        synced: synced,
+        snapshotVersion: doc.snapshotVersion,
+        message: synced ? "동기화가 완료되었습니다." : "동기화할 변경사항이 없습니다.",
+      },
+    });
+
+    // 채널 내 유저들에게 동기화 완료 알림
+    broadcastToChannel(channelId, "docSyncCompleted", {
+      time: Date.now(),
+      docId: docId,
+      channelId: channelId,
+      synced: synced,
+      syncedBy: userId,
+    });
+
+    console.log(`문서 동기화: ${docId} by ${userId} (synced: ${synced})`);
+  } catch (error) {
+    logError("DOC_SYNC_HANDLER", error);
+
+    // 오류 시 잠금 해제 시도
+    try {
+      await unlockDoc(docId);
+    } catch (e) {
+      // 무시
+    }
+
+    sendSystemMessage(ws, "문서 동기화 중 오류가 발생했습니다.");
+  }
+}
+
+// === 스냅샷 생성 핸들러 (오너만) ===
+
+async function handleSnapshotDoc(ws, data) {
+  const { channelId, docId } = data;
+  const userId = ws.user.id;
+
+  // 필수값 검증
+  if (!channelId || typeof channelId !== "string") {
+    return sendSystemMessage(ws, "채널 ID를 입력해주세요.");
+  }
+  if (!docId || typeof docId !== "string") {
+    return sendSystemMessage(ws, "문서 ID를 입력해주세요.");
+  }
+
+  try {
+    // 채널 멤버십 및 권한 확인
+    let membership;
+    try {
+      membership = await prisma.channelMember.findUnique({
+        where: {
+          channelId_userId: {
+            channelId: channelId,
+            userId: userId,
+          },
+        },
+      });
+    } catch (dbError) {
+      logError("DB_MEMBER_FIND", dbError);
+      return sendSystemMessage(ws, "권한 확인 중 오류가 발생했습니다.");
+    }
+
+    if (!membership || membership.status !== 0) {
+      return sendSystemMessage(ws, "해당 채널에 가입되어 있지 않습니다.");
+    }
+
+    // 오너 권한 확인 (permission: 0)
+    if (membership.permission !== 0) {
+      return sendSystemMessage(ws, "스냅샷 권한이 없습니다. (오너만 가능)");
+    }
+
+    // 문서 존재 확인
+    const doc = await getDocFromCache(docId);
+    if (!doc || doc.channelId !== channelId) {
+      return sendSystemMessage(ws, "문서가 존재하지 않습니다.");
+    }
+
+    const oldVersion = doc.snapshotVersion;
+
+    // 1. 문서 잠금
+    await lockDoc(docId, "스냅샷 생성 중입니다.");
+
+    // 2. 스냅샷 생성 (Redis → Supabase → 로그 초기화 → Redis 갱신)
+    const result = await createSnapshot(docId);
+
+    // 3. 문서 잠금 해제
+    await unlockDoc(docId);
+
+    // 문서 열람 중인 유저들에게 새 문서 상태 전파
+    broadcastToDoc(docId, "docSnapshotCreated", {
+      time: Date.now(),
+      docId: docId,
+      oldVersion: oldVersion,
+      newVersion: result.snapshotVersion,
+      content: result.doc.content,
+      logMetadata: result.doc.logMetadata,
+      createdBy: userId,
+    });
+
+    // 스냅샷 결과 전송
+    safeSend(ws, {
+      event: "snapshotCreated",
+      data: {
+        time: Date.now(),
+        docId: docId,
+        channelId: channelId,
+        oldVersion: oldVersion,
+        newVersion: result.snapshotVersion,
+        message: `스냅샷이 생성되었습니다. (v${result.snapshotVersion})`,
+      },
+    });
+
+    // 채널 내 유저들에게 스냅샷 완료 알림
+    broadcastToChannel(channelId, "docSnapshotCompleted", {
+      time: Date.now(),
+      docId: docId,
+      channelId: channelId,
+      newVersion: result.snapshotVersion,
+      snapshotBy: userId,
+    });
+
+    console.log(`스냅샷 생성: ${docId} by ${userId} (v${result.snapshotVersion})`);
+  } catch (error) {
+    logError("DOC_SNAPSHOT_HANDLER", error);
+
+    // 오류 시 잠금 해제 시도
+    try {
+      await unlockDoc(docId);
+    } catch (e) {
+      // 무시
+    }
+
+    sendSystemMessage(ws, "스냅샷 생성 중 오류가 발생했습니다.");
+  }
+}
+
+// === 문서 상태 조회 핸들러 ===
+
+async function handleGetDocStatus(ws, data) {
+  const { docId } = data;
+
+  // docId 없으면 현재 문서
+  const targetDocId = docId || ws.currentDoc;
+
+  if (!targetDocId) {
+    return sendSystemMessage(ws, "문서 ID를 입력해주세요.");
+  }
+
+  const doc = await getDocFromCache(targetDocId);
+
+  if (!doc) {
+    return sendSystemMessage(ws, "문서가 존재하지 않거나 캐시되지 않았습니다.");
+  }
+
+  safeSend(ws, {
+    event: "docStatus",
+    data: {
+      time: Date.now(),
+      docId: targetDocId,
+      status: doc.status,
+      statusText:
+        doc.status === DOC_STATUS.NORMAL
+          ? "normal"
+          : doc.status === DOC_STATUS.DELETED
+            ? "deleted"
+            : "locked",
+      snapshotVersion: doc.snapshotVersion,
+      logCount: (doc.logMetadata || []).length,
     },
   });
 }

@@ -83,7 +83,7 @@ model DocumentData {
   name            String
   content         String      @default("")
   logMetadata     Json        @default("[]") @map("log_metadata")
-  snapshotVersion Int         @default(0) @map("snapshot_version")
+  snapshotVersion String      @default("1.0.0") @map("snapshot_version") @db.VarChar(20)
   lastSnapshotAt  DateTime    @default(now()) @map("last_snapshot_at") @db.Timestamptz(6)
   permission      Int         @default(0)
   status          Int         @default(0)
