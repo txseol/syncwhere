@@ -3130,10 +3130,22 @@ async function handleGetDocUsers(ws, data) {
 
 // === LSEQ 문서 편집 핸들러 ===
 // 클라이언트는 의도(intent)만 전송, 서버가 ID 생성
-// insert: { intent: "insert", leftId, rightId, value }
-// delete: { intent: "delete", id }
+//
+// ## INSERT 요청 포맷
+// 1. 청크 사이 삽입: { intent: "insert", leftId, rightId, value }
+//    - leftId !== rightId: 두 청크 사이에 새 청크 생성
+// 2. 청크 내부 삽입: { intent: "insert", leftId, rightId, offset, value }
+//    - leftId === rightId: 해당 청크를 분할하여 삽입
+//    - offset: 청크 내 삽입 위치 (0-based)
+// 3. 문서 맨 앞: { intent: "insert", leftId: null, rightId: "첫청크ID", value }
+// 4. 문서 맨 뒤: { intent: "insert", leftId: "마지막청크ID", rightId: null, value }
+//
+// ## DELETE 요청 포맷
+// 1. 청크 전체 삭제: { intent: "delete", id }
+// 2. 문자 삭제: { intent: "delete", id, offset }
+//
 async function handleEditDoc(ws, data) {
-  const { docId, intent, leftId, rightId, id, value } = data;
+  const { docId, intent, leftId, rightId, id, value, offset } = data;
   const userId = ws.user.id;
 
   // 필수값 검증
@@ -3168,44 +3180,83 @@ async function handleEditDoc(ws, data) {
 
     if (intent === "insert") {
       // === INSERT 작업 ===
-      if (typeof value !== "string" || value.length !== 1) {
-        return sendSystemMessage(ws, "삽입할 문자를 지정해주세요 (1글자).");
+      if (typeof value !== "string" || value.length < 1) {
+        return sendSystemMessage(ws, "삽입할 문자를 지정해주세요.");
       }
 
-      // Redis에 삽입 (서버가 ID 생성)
-      const result = await insertCharToDoc(
-        docId,
-        leftId || null,
-        rightId || null,
-        value,
-        userId,
-      );
-      if (!result) {
-        return sendSystemMessage(ws, "문자 삽입에 실패했습니다.");
+      let result;
+
+      // 케이스 1: 청크 내부 삽입 (leftId === rightId && offset 있음)
+      // 또는 offset만 제공된 경우 (leftId를 targetId로 사용)
+      const isInternalInsert = 
+        (leftId && leftId === rightId && typeof offset === "number") ||
+        (leftId && typeof offset === "number" && !rightId);
+
+      if (isInternalInsert) {
+        // 청크 내부 삽입 → splitAndInsert 사용
+        const targetId = leftId;
+        result = await splitAndInsert(docId, targetId, offset, value, userId);
+
+        if (!result) {
+          return sendSystemMessage(ws, "문자 삽입에 실패했습니다.");
+        }
+
+        // 브로드캐스트: 분할 결과
+        broadcastToDoc(docId, "docOp", {
+          time: Date.now(),
+          docId: docId,
+          op: "split",
+          targetId: targetId,
+          offset: offset,
+          id: result.newId,
+          char: value,
+          splitResult: result.splitResult,
+          editedBy: userId,
+          logVersion: result.newVersion,
+        });
+
+        console.log(
+          `LSEQ 분할삽입: ${docId} target=${targetId} offset=${offset} id=${result.newId} char='${value}' by ${userId}`,
+        );
+      } else {
+        // 케이스 2: 청크 사이 삽입 → insertCharToDoc 사용
+        result = await insertCharToDoc(
+          docId,
+          leftId || null,
+          rightId || null,
+          value,
+          userId,
+        );
+
+        if (!result) {
+          return sendSystemMessage(ws, "문자 삽입에 실패했습니다.");
+        }
+
+        // 모든 문서 열람자에게 브로드캐스트 (자신 포함)
+        broadcastToDoc(docId, "docOp", {
+          time: Date.now(),
+          docId: docId,
+          op: "insert",
+          id: result.newId,
+          char: value,
+          leftId: leftId || null,
+          rightId: rightId || null,
+          editedBy: userId,
+          logVersion: result.newVersion,
+        });
+
+        console.log(
+          `LSEQ 삽입: ${docId} id=${result.newId} char='${value}' by ${userId}`,
+        );
       }
-
-      // 모든 문서 열람자에게 브로드캐스트 (자신 포함)
-      broadcastToDoc(docId, "docOp", {
-        time: Date.now(),
-        docId: docId,
-        op: "insert",
-        id: result.newId,
-        char: value,
-        editedBy: userId,
-        logVersion: result.newVersion,
-      });
-
-      console.log(
-        `LSEQ 삽입: ${docId} id=${result.newId} char='${value}' by ${userId}`,
-      );
     } else if (intent === "delete") {
       // === DELETE 작업 ===
       if (!id || typeof id !== "string") {
         return sendSystemMessage(ws, "삭제할 문자의 ID를 지정해주세요.");
       }
 
-      // Redis에서 삭제
-      const result = await deleteCharFromDoc(docId, id, userId);
+      // Redis에서 삭제 (offset이 있으면 해당 위치의 문자만 삭제)
+      const result = await deleteCharFromDoc(docId, id, userId, typeof offset === "number" ? offset : null);
       if (!result) {
         return sendSystemMessage(ws, "문자 삭제에 실패했습니다.");
       }
@@ -3222,11 +3273,12 @@ async function handleEditDoc(ws, data) {
         docId: docId,
         op: "delete",
         id: id,
+        offset: typeof offset === "number" ? offset : null,
         editedBy: userId,
         logVersion: result.newVersion,
       });
 
-      console.log(`LSEQ 삭제: ${docId} id=${id} by ${userId}`);
+      console.log(`LSEQ 삭제: ${docId} id=${id}${typeof offset === "number" ? ` offset=${offset}` : ""} by ${userId}`);
     }
   } catch (error) {
     logError("DOC_EDIT_LSEQ", error);
