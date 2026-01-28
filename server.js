@@ -336,12 +336,16 @@ function charsToChunks(chars) {
 }
 
 // chunks 배열을 chars 배열로 변환 (클라이언트 호환용)
+// 주의: 청크의 모든 문자는 청크 ID를 공유함 (가상 ID 없음)
 function chunksToChars(chunks) {
   const chars = [];
   for (const chunk of chunks) {
+    // 청크의 모든 문자에 동일한 청크 ID 사용
+    // 클라이언트는 청크 ID + 오프셋으로 위치 파악
     for (let i = 0; i < chunk.text.length; i++) {
       chars.push({
-        id: i === 0 ? chunk.id : `${chunk.id}:${i}`,
+        id: chunk.id,       // 청크 ID (가상 ID 아님)
+        offset: i,          // 청크 내 오프셋
         char: chunk.text[i]
       });
     }
@@ -584,8 +588,22 @@ async function insertTextToDoc(docId, leftId, rightId, text, userId) {
     // chunks 배열 가져오기 (구버전 호환)
     let chunks = doc.chunks || charsToChunks(doc.chars) || [];
 
+    // 가상 ID (chunkId:offset) 처리 - 잘못된 형식이면 무시
+    // 이전 버전 호환: ":" 포함된 ID는 청크 ID 부분만 추출
+    let resolvedLeftId = leftId;
+    let resolvedRightId = rightId;
+    
+    if (leftId && leftId.includes(":")) {
+      console.warn(`[CRDT] 가상 ID 감지 (leftId): ${leftId}`);
+      resolvedLeftId = leftId.split(":")[0];
+    }
+    if (rightId && rightId.includes(":")) {
+      console.warn(`[CRDT] 가상 ID 감지 (rightId): ${rightId}`);
+      resolvedRightId = rightId.split(":")[0];
+    }
+
     // 새 LSEQ ID 생성
-    const newId = generateLseqBetween(leftId, rightId);
+    const newId = generateLseqBetween(resolvedLeftId, resolvedRightId);
 
     // 새 청크 삽입
     const newChunk = { id: newId, text: text };
@@ -950,14 +968,24 @@ async function insertCharToDoc(docId, leftId, rightId, value, userId) {
 }
 
 // 구버전 호환: 단일 문자/청크 삭제
-async function deleteCharFromDoc(docId, charId, userId) {
-  // charId가 가상 ID (chunkId:offset)인지 확인
-  if (charId && charId.includes(":")) {
-    const [chunkId, offsetStr] = charId.split(":");
-    const offset = parseInt(offsetStr, 10);
-    // 해당 위치의 한 글자만 삭제
-    return await trimChunk(docId, chunkId, offset, offset + 1, userId);
+// charId: 청크 ID 또는 {chunkId, offset} 형태
+// offset이 제공되면 해당 위치의 한 글자만 삭제
+async function deleteCharFromDoc(docId, charId, userId, offset = null) {
+  // offset이 명시적으로 제공된 경우
+  if (typeof offset === "number") {
+    return await trimChunk(docId, charId, offset, offset + 1, userId);
   }
+  
+  // charId가 가상 ID 형식 (chunkId:offset)인 경우 - 구버전 호환
+  if (charId && typeof charId === "string" && charId.includes(":")) {
+    const parts = charId.split(":");
+    const chunkId = parts[0];
+    const charOffset = parseInt(parts[1], 10);
+    if (!isNaN(charOffset)) {
+      return await trimChunk(docId, chunkId, charOffset, charOffset + 1, userId);
+    }
+  }
+  
   // 일반 청크 ID인 경우 전체 삭제
   return await deleteChunk(docId, charId, userId);
 }
@@ -2713,7 +2741,8 @@ async function handleEnterDoc(ws, data) {
         dir: document.dir,
         depth: document.depth,
         content: document.content,
-        chars: document.chars || [], // LSEQ chars 배열 (id, char)
+        chunks: document.chunks || [], // 청크 배열 (권장)
+        chars: document.chars || [],   // 구버전 호환용
         snapshotVersion: document.snapshotVersion,
         status: document.status,
         statusText:
@@ -3205,10 +3234,6 @@ async function handleEditDoc(ws, data) {
   }
 }
 
-// === Batch 편집 핸들러 ===
-// 여러 문자를 한번에 처리
-// 지원 작업:
-// - insertText: { intent: "insertText", leftId, rightId, text } - 텍스트 삽입
 // ===================================================
 // 청크 기반 Batch 편집 핸들러
 // ===================================================
