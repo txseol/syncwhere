@@ -123,6 +123,153 @@ function createInitialVersion() {
   return `${SERVICE_VERSION}.0.0`;
 }
 
+// === LSEQ ID 유틸리티 (올바른 CRDT 구현) ===
+// - ID는 정수 배열 개념
+// - 저장/정렬은 "00001.00002.00003" 문자열
+// - 값 범위: 1 ~ 65535
+// - 0은 가상 경계에서만 내부 계산용으로 사용
+// - 초기 ID: [32768]
+
+const LSEQ_MIN = 1;
+const LSEQ_MAX = 65535;
+const LSEQ_MID = 32768;
+const LSEQ_PAD = 5;
+
+// ===============================
+// 변환 유틸
+// ===============================
+
+// 정수 배열 → 문자열 ID (저장/정렬용)
+function lseqToString(arr) {
+  return arr.map((n) => String(n).padStart(LSEQ_PAD, "0")).join(".");
+}
+
+// 문자열 ID → 정수 배열
+function stringToLseq(str) {
+  if (!str) return [];
+  return str.split(".").map((s) => parseInt(s, 10));
+}
+
+// ===============================
+// LSEQ 비교 (prefix rule 포함)
+// ===============================
+// a < b  => -1
+// a == b => 0
+// a > b  => 1
+// 핵심: prefix가 짧으면 항상 앞 (0으로 치환 비교 금지)
+function compareLseq(a, b) {
+  const A = typeof a === "string" ? stringToLseq(a) : a;
+  const B = typeof b === "string" ? stringToLseq(b) : b;
+
+  const minLen = Math.min(A.length, B.length);
+
+  for (let i = 0; i < minLen; i++) {
+    if (A[i] < B[i]) return -1;
+    if (A[i] > B[i]) return 1;
+  }
+
+  // prefix rule: 짧은 쪽이 앞
+  if (A.length < B.length) return -1;
+  if (A.length > B.length) return 1;
+  return 0;
+}
+
+// ===============================
+// 랜덤 유틸 (LSEQ 핵심: 확률적 분산)
+// ===============================
+function randomBetween(min, max) {
+  // min < x < max (양 끝 제외)
+  if (max - min <= 1) return min + 1; // 공간이 없으면 min+1
+  return min + 1 + Math.floor(Math.random() * (max - min - 1));
+}
+
+// ===============================
+// 핵심: 두 ID 사이 LSEQ 생성
+// ===============================
+// 핵심: 두 ID 사이 LSEQ 생성
+// ===============================
+// leftId: 왼쪽 ID (null이면 ⊥ = 빈 배열)
+// rightId: 오른쪽 ID (null이면 ⊤ = 빈 배열)
+// 가상 경계: left가 없으면 0, right가 없으면 LSEQ_MAX+1
+// 참고: 0은 맨 앞 삽입 시 depth 확장에서 사용됨
+function generateLseqBetween(leftId, rightId) {
+  const left = leftId ? stringToLseq(leftId) : [];
+  const right = rightId ? stringToLseq(rightId) : [];
+
+  const result = [];
+  let depth = 0;
+
+  while (true) {
+    // 가상 경계 처리: left 끝나면 0, right 끝나면 MAX+1
+    const l = left[depth] ?? 0;
+    const r = right[depth] ?? LSEQ_MAX + 1;
+
+    // 사이에 공간이 있는 경우 (r - l > 1)
+    if (r - l > 1) {
+      // 랜덤 분산으로 depth 폭발 방지
+      // l+1 ~ r-1 사이에서 랜덤 선택
+      const value = l + 1 + Math.floor(Math.random() * (r - l - 1));
+      result.push(value);
+      break;
+    }
+
+    // 공간 없음 → l 복사 후 다음 depth로
+    result.push(l);
+    depth++;
+  }
+
+  return lseqToString(result);
+}
+
+// 초기 문자 ID 생성 (빈 문서에 첫 문자 삽입 시)
+function generateInitialLseq() {
+  return lseqToString([LSEQ_MID]);
+}
+
+// ===============================
+// chars 배열 유틸 (로컬 캐시용)
+// ===============================
+
+// chars 배열에서 특정 ID의 인덱스 찾기 (이진 탐색)
+function findCharIndex(chars, id) {
+  let lo = 0;
+  let hi = chars.length - 1;
+
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const cmp = compareLseq(chars[mid].id, id);
+
+    if (cmp === 0) return mid;
+    if (cmp < 0) lo = mid + 1;
+    else hi = mid - 1;
+  }
+
+  return -1; // 찾지 못함
+}
+
+// chars 배열에 새 문자 삽입 (정렬 유지)
+function insertCharSorted(chars, newChar) {
+  let lo = 0;
+  let hi = chars.length;
+
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (compareLseq(chars[mid].id, newChar.id) < 0) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+
+  chars.splice(lo, 0, newChar);
+  return lo;
+}
+
+// chars 배열을 문자열로 변환 (content 생성)
+function charsToContent(chars) {
+  return chars.map((c) => c.char).join("");
+}
+
 // === 문서 상태 상수 ===
 const DOC_STATUS = {
   NORMAL: 0, // 정상 (작업 가능)
@@ -265,7 +412,7 @@ function getDocUserCount(docId) {
 
 // === Redis 문서 캐시 함수 ===
 const DOC_CACHE_PREFIX = "doc:";
-const DOC_CACHE_TTL = 60 * 60 * 24; // 24시간
+// TTL 제거 - 문서는 영구 캐싱, 서버 시작 시 초기화
 
 // Redis 문서 캐시 키 생성
 function getDocCacheKey(docId) {
@@ -287,11 +434,11 @@ async function getDocFromCache(docId) {
   }, null);
 }
 
-// Redis에 문서 캐시 저장
+// Redis에 문서 캐시 저장 (TTL 없음)
 async function setDocToCache(docId, docData) {
   return await safeRedis(async () => {
     const key = getDocCacheKey(docId);
-    await redis.set(key, JSON.stringify(docData), { EX: DOC_CACHE_TTL });
+    await redis.set(key, JSON.stringify(docData));
     return true;
   }, false);
 }
@@ -317,28 +464,120 @@ async function updateDocCache(docId, updates) {
   }, false);
 }
 
-// Redis 문서에 로그 추가 (CRDT 편집 로그)
-async function appendDocLog(docId, logEntry) {
+// === LSEQ 문서 연산 함수 ===
+
+// 문서에 문자 삽입 (LSEQ 방식)
+// leftId: 삽입 위치 왼쪽 문자 ID (null이면 맨 앞)
+// rightId: 삽입 위치 오른쪽 문자 ID (null이면 맨 뒤)
+// value: 삽입할 문자
+// userId: 작업자 ID
+async function insertCharToDoc(docId, leftId, rightId, value, userId) {
   return await safeRedis(async () => {
     const doc = await getDocFromCache(docId);
     if (!doc) return null;
+    if (doc.status !== DOC_STATUS.NORMAL) return null;
+
+    // 새 LSEQ ID 생성
+    const newId = generateLseqBetween(leftId, rightId);
+
+    // 새 문자 객체
+    const newChar = {
+      id: newId,
+      char: value,
+    };
+
+    // chars 배열에 삽입 (정렬 유지)
+    const chars = doc.chars || [];
+    insertCharSorted(chars, newChar);
 
     // 로그 추가
+    const logEntry = {
+      op: "insert",
+      id: newId,
+      char: value,
+      userId: userId,
+      timestamp: Date.now(),
+    };
     const logs = doc.logMetadata || [];
     logs.push(logEntry);
 
     // 버전 증가
     const newVersion = incrementLogVersion(doc.snapshotVersion);
 
+    // content 재생성
+    const newContent = charsToContent(chars);
+
     const updated = {
       ...doc,
+      chars: chars,
+      content: newContent,
       logMetadata: logs,
       snapshotVersion: newVersion,
       updatedAt: new Date().toISOString(),
     };
 
     await setDocToCache(docId, updated);
-    return { newVersion, logEntry };
+
+    return {
+      newVersion,
+      newId,
+      char: value,
+      content: newContent,
+    };
+  }, null);
+}
+
+// 문서에서 문자 삭제 (LSEQ 방식)
+async function deleteCharFromDoc(docId, charId, userId) {
+  return await safeRedis(async () => {
+    const doc = await getDocFromCache(docId);
+    if (!doc) return null;
+    if (doc.status !== DOC_STATUS.NORMAL) return null;
+
+    const chars = doc.chars || [];
+    const index = findCharIndex(chars, charId);
+
+    if (index === -1) {
+      // 이미 삭제된 문자거나 존재하지 않음
+      return { alreadyDeleted: true };
+    }
+
+    const deletedChar = chars[index];
+    chars.splice(index, 1);
+
+    // 로그 추가
+    const logEntry = {
+      op: "delete",
+      id: charId,
+      char: deletedChar.char,
+      userId: userId,
+      timestamp: Date.now(),
+    };
+    const logs = doc.logMetadata || [];
+    logs.push(logEntry);
+
+    // 버전 증가
+    const newVersion = incrementLogVersion(doc.snapshotVersion);
+
+    // content 재생성
+    const newContent = charsToContent(chars);
+
+    const updated = {
+      ...doc,
+      chars: chars,
+      content: newContent,
+      logMetadata: logs,
+      snapshotVersion: newVersion,
+      updatedAt: new Date().toISOString(),
+    };
+
+    await setDocToCache(docId, updated);
+
+    return {
+      newVersion,
+      deletedId: charId,
+      content: newContent,
+    };
   }, null);
 }
 
@@ -438,7 +677,7 @@ async function syncDocToSupabase(docId) {
   }
 }
 
-// Supabase에서 문서를 Redis 캐시로 로드
+// Supabase에서 문서를 Redis 캐시로 로드 (chars 배열 생성)
 async function loadDocToCache(docId) {
   try {
     const doc = await prisma.documentData.findUnique({
@@ -461,14 +700,47 @@ async function loadDocToCache(docId) {
 
     if (!doc) return null;
 
+    // logMetadata에서 chars 배열 복원 또는 content에서 생성
+    let chars = [];
+
+    // logMetadata가 chars 형태인지 확인 (스냅샷 후 저장된 경우)
+    if (
+      Array.isArray(doc.logMetadata) &&
+      doc.logMetadata.length > 0 &&
+      doc.logMetadata[0]?.id &&
+      doc.logMetadata[0]?.char
+    ) {
+      // 이미 chars 형태로 저장됨 (스냅샷 데이터)
+      chars = doc.logMetadata;
+    } else if (doc.content && doc.content.length > 0) {
+      // content에서 chars 생성 (마이그레이션 또는 초기 로드)
+      // 기존 content는 ID가 없으므로 새로 생성
+      let lastId = null;
+      for (const char of doc.content) {
+        const newId = generateLseqBetween(lastId, null);
+        chars.push({ id: newId, char: char });
+        lastId = newId;
+      }
+    }
+
     const cacheData = {
-      ...doc,
+      id: doc.id,
+      channelId: doc.channelId,
+      name: doc.name,
+      content: doc.content,
+      chars: chars, // LSEQ chars 배열
+      logMetadata: [], // 로그는 비움 (캐시에서는 chars로 관리)
+      snapshotVersion: doc.snapshotVersion,
+      status: doc.status,
+      dir: doc.dir,
+      depth: doc.depth,
+      createdBy: doc.createdBy,
       createdAt: doc.createdAt.toISOString(),
       updatedAt: doc.updatedAt.toISOString(),
     };
 
     await setDocToCache(docId, cacheData);
-    console.log(`문서 캐시 로드: ${docId}`);
+    console.log(`문서 캐시 로드: ${docId} (${chars.length} chars)`);
     return cacheData;
   } catch (error) {
     logError("DOC_CACHE_LOAD", error);
@@ -489,41 +761,44 @@ async function onDocDisconnect(docId) {
 // === 스냅샷 생성 함수 ===
 
 // 로그를 스냅샷으로 병합하고 새 버전 생성
+// 스냅샷: chars 배열에서 id와 char만 남기고 로그(userId, timestamp 등) 제거
 async function createSnapshot(docId) {
   try {
-    // 1. Redis 캐시를 먼저 Supabase로 동기화
-    await syncDocToSupabase(docId);
-
-    // 2. Supabase에서 문서 조회
-    const doc = await prisma.documentData.findUnique({
-      where: { id: docId },
-    });
-
-    if (!doc) {
-      throw new Error("문서가 존재하지 않습니다.");
+    // 1. Redis 캐시에서 최신 문서 조회
+    const cachedDoc = await getDocFromCache(docId);
+    if (!cachedDoc) {
+      throw new Error("캐시된 문서가 없습니다.");
     }
 
-    // 3. 로그를 content에 적용 (실제 CRDT 병합 로직)
-    // 현재는 content가 이미 최신 상태라고 가정 (로그는 변경 이력용)
-    const newSnapshotVersion = incrementSnapshotVersion(doc.snapshotVersion);
+    // 2. chars에서 순수 스냅샷 데이터 생성 (id, char만 유지)
+    const chars = cachedDoc.chars || [];
+    const snapshotChars = chars.map((c) => ({ id: c.id, char: c.char }));
+    const content = charsToContent(chars);
 
-    // 4. Supabase 업데이트 (로그 비우고 스냅샷 버전 증가)
+    // 3. 새 버전 생성
+    const newSnapshotVersion = incrementSnapshotVersion(
+      cachedDoc.snapshotVersion,
+    );
+
+    // 4. Supabase 업데이트 (logMetadata에 chars 저장, 로그 정보 제거)
     const updated = await prisma.documentData.update({
       where: { id: docId },
       data: {
-        logMetadata: [], // 로그 초기화
+        content: content,
+        logMetadata: snapshotChars, // chars 배열 저장 (id, char만)
         snapshotVersion: newSnapshotVersion,
         lastSnapshotAt: new Date(),
       },
     });
 
-    // 5. Redis 캐시 갱신
+    // 5. Redis 캐시 갱신 (로그 비움)
     const cacheData = {
       id: updated.id,
       channelId: updated.channelId,
       name: updated.name,
-      content: updated.content,
-      logMetadata: [],
+      content: content,
+      chars: snapshotChars, // 스냅샷 chars
+      logMetadata: [], // 로그 초기화
       snapshotVersion: newSnapshotVersion,
       status: updated.status,
       dir: updated.dir,
@@ -535,7 +810,9 @@ async function createSnapshot(docId) {
 
     await setDocToCache(docId, cacheData);
 
-    console.log(`스냅샷 생성 완료: ${docId} (v${newSnapshotVersion})`);
+    console.log(
+      `스냅샷 생성 완료: ${docId} (v${newSnapshotVersion}, ${snapshotChars.length} chars)`,
+    );
     return { snapshotVersion: newSnapshotVersion, doc: cacheData };
   } catch (error) {
     logError("CREATE_SNAPSHOT", error);
@@ -584,17 +861,34 @@ async function initRedis() {
     await redis.connect();
     console.log("Redis 연결됨");
 
-    // 서버 시작시 채널 관련 캐시 초기화
+    // 서버 시작시 모든 Redis 캐시 초기화
     try {
-      const channelKeys = await redis.keys("channel:*");
-      if (channelKeys.length > 0) {
-        await redis.del(channelKeys);
-        console.log(`Redis 초기화: ${channelKeys.length}개 채널 캐시 삭제됨`);
-      }
+      await redis.flushDb();
+      console.log("Redis 초기화: 모든 캐시 삭제됨");
     } catch (cacheError) {
       logError("REDIS_CACHE_CLEAR", cacheError);
       // 캐시 초기화 실패는 치명적이지 않으므로 계속 진행
     }
+
+    // 모든 활성 문서를 Supabase에서 Redis로 로드
+    try {
+      const documents = await prisma.documentData.findMany({
+        where: {
+          status: { not: DOC_STATUS.DELETED },
+        },
+      });
+
+      let loadedCount = 0;
+      for (const doc of documents) {
+        await loadDocToCache(doc.id);
+        loadedCount++;
+      }
+      console.log(`Redis 문서 캐싱 완료: ${loadedCount}개 문서 로드됨`);
+    } catch (loadError) {
+      logError("REDIS_DOC_LOAD", loadError);
+      console.warn("문서 캐싱 실패 - 요청 시 개별 로드됨");
+    }
+
     return true;
   } catch (error) {
     logError("REDIS_INIT", error);
@@ -2000,7 +2294,7 @@ async function handleEnterDoc(ws, data) {
         dir: document.dir,
         depth: document.depth,
         content: document.content,
-        logMetadata: document.logMetadata || [],
+        chars: document.chars || [], // LSEQ chars 배열 (id, char)
         snapshotVersion: document.snapshotVersion,
         status: document.status,
         statusText:
@@ -2389,16 +2683,23 @@ async function handleGetDocUsers(ws, data) {
 
 // === 문서 편집 핸들러 (CRDT 로그 추가) ===
 
+// === LSEQ 문서 편집 핸들러 ===
+// 클라이언트는 의도(intent)만 전송, 서버가 ID 생성
+// insert: { intent: "insert", leftId, rightId, value }
+// delete: { intent: "delete", id }
 async function handleEditDoc(ws, data) {
-  const { docId, operation } = data;
+  const { docId, intent, leftId, rightId, id, value } = data;
   const userId = ws.user.id;
 
   // 필수값 검증
   if (!docId || typeof docId !== "string") {
     return sendSystemMessage(ws, "문서 ID를 입력해주세요.");
   }
-  if (!operation || typeof operation !== "object") {
-    return sendSystemMessage(ws, "편집 작업 정보가 필요합니다.");
+  if (!intent || !["insert", "delete"].includes(intent)) {
+    return sendSystemMessage(
+      ws,
+      "유효한 편집 의도가 필요합니다 (insert/delete).",
+    );
   }
 
   // 현재 문서를 열람 중인지 확인
@@ -2420,49 +2721,62 @@ async function handleEditDoc(ws, data) {
       });
     }
 
-    // CRDT 로그 엔트리 생성
-    const logEntry = {
-      id: generateUUID(),
-      userId: userId,
-      timestamp: Date.now(),
-      operation: operation, // { type: 'insert'|'delete', position: [...], char: '...', ... }
-    };
+    if (intent === "insert") {
+      // === INSERT 작업 ===
+      if (typeof value !== "string" || value.length !== 1) {
+        return sendSystemMessage(ws, "삽입할 문자를 지정해주세요 (1글자).");
+      }
 
-    // Redis 캐시에 로그 추가
-    const result = await appendDocLog(docId, logEntry);
+      // Redis에 삽입 (서버가 ID 생성)
+      const result = await insertCharToDoc(docId, leftId || null, rightId || null, value, userId);
+      if (!result) {
+        return sendSystemMessage(ws, "문자 삽입에 실패했습니다.");
+      }
 
-    if (!result) {
-      return sendSystemMessage(ws, "편집 저장에 실패했습니다.");
-    }
-
-    // 동일 문서를 열람 중인 다른 유저들에게 편집 내용 전파
-    broadcastToDoc(
-      docId,
-      "docEdited",
-      {
+      // 모든 문서 열람자에게 브로드캐스트 (자신 포함)
+      broadcastToDoc(docId, "docOp", {
         time: Date.now(),
         docId: docId,
-        logEntry: logEntry,
-        newVersion: result.newVersion,
+        op: "insert",
+        id: result.newId,
+        char: value,
         editedBy: userId,
-      },
-      ws, // 자신 제외
-    );
+        logVersion: result.newVersion,
+      });
 
-    // 편집자에게 확인 응답
-    safeSend(ws, {
-      event: "editConfirmed",
-      data: {
+      console.log(`LSEQ 삽입: ${docId} id=${result.newId} char='${value}' by ${userId}`);
+    } else if (intent === "delete") {
+      // === DELETE 작업 ===
+      if (!id || typeof id !== "string") {
+        return sendSystemMessage(ws, "삭제할 문자의 ID를 지정해주세요.");
+      }
+
+      // Redis에서 삭제
+      const result = await deleteCharFromDoc(docId, id, userId);
+      if (!result) {
+        return sendSystemMessage(ws, "문자 삭제에 실패했습니다.");
+      }
+
+      if (result.alreadyDeleted) {
+        // 이미 삭제된 문자 (중복 삭제 요청) - 무시하고 성공 처리
+        console.log(`LSEQ 삭제 무시: ${docId} id=${id} (이미 없음)`);
+        return;
+      }
+
+      // 모든 문서 열람자에게 브로드캐스트 (자신 포함)
+      broadcastToDoc(docId, "docOp", {
         time: Date.now(),
         docId: docId,
-        logEntryId: logEntry.id,
-        newVersion: result.newVersion,
-      },
-    });
+        op: "delete",
+        id: id,
+        editedBy: userId,
+        logVersion: result.newVersion,
+      });
 
-    console.log(`문서 편집: ${docId} by ${userId} (v${result.newVersion})`);
+      console.log(`LSEQ 삭제: ${docId} id=${id} by ${userId}`);
+    }
   } catch (error) {
-    logError("DOC_EDIT", error);
+    logError("DOC_EDIT_LSEQ", error);
     sendSystemMessage(ws, "문서 편집 중 오류가 발생했습니다.");
   }
 }
