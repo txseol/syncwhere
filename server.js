@@ -3331,11 +3331,15 @@ async function handleEditDocBatch(ws, data) {
 
     // ===================================================
     // 케이스 1: 청크 내부 삽입 (분할)
+    // 조건: targetId + offset 또는 leftId === rightId + offset
     // ===================================================
-    if (batchText && targetId && typeof offset === "number") {
+    const effectiveTargetId = targetId || (leftId && leftId === rightId ? leftId : null);
+    const isInternalInsert = batchText && effectiveTargetId && typeof offset === "number";
+
+    if (isInternalInsert) {
       const result = await splitAndInsert(
         docId,
-        targetId,
+        effectiveTargetId,
         offset,
         batchText,
         userId,
@@ -3351,7 +3355,7 @@ async function handleEditDocBatch(ws, data) {
         docId: docId,
         operations: [{
           op: "split",
-          targetId: targetId,
+          targetId: effectiveTargetId,
           offset: offset,
           insertId: result.newId,
           insertText: batchText,
@@ -3361,7 +3365,7 @@ async function handleEditDocBatch(ws, data) {
         logVersion: result.newVersion,
       });
 
-      console.log(`[CRDT] 청크 분할 삽입: ${docId} target=${targetId} offset=${offset} len=${batchText.length}`);
+      console.log(`[CRDT] 청크 분할 삽입: ${docId} target=${effectiveTargetId} offset=${offset} len=${batchText.length}`);
       return;
     }
 
