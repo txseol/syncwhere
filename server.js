@@ -123,12 +123,13 @@ function createInitialVersion() {
   return `${SERVICE_VERSION}.0.0`;
 }
 
-// === LSEQ ID 유틸리티 (올바른 CRDT 구현) ===
+// === LSEQ ID 유틸리티 (청크 기반 CRDT 구현) ===
 // - ID는 정수 배열 개념
 // - 저장/정렬은 "00001.00002.00003" 문자열
 // - 값 범위: 1 ~ 65535
 // - 0은 가상 경계에서만 내부 계산용으로 사용
 // - 초기 ID: [32768]
+// - 청크(Chunk): { id, text } 형태로 여러 문자를 하나의 ID로 관리
 
 const LSEQ_MIN = 1;
 const LSEQ_MAX = 65535;
@@ -186,8 +187,6 @@ function randomBetween(min, max) {
 // ===============================
 // 핵심: 두 ID 사이 LSEQ 생성
 // ===============================
-// 핵심: 두 ID 사이 LSEQ 생성
-// ===============================
 // leftId: 왼쪽 ID (null이면 ⊥ = 빈 배열)
 // rightId: 오른쪽 ID (null이면 ⊤ = 빈 배열)
 // 가상 경계: left가 없으면 0, right가 없으면 LSEQ_MAX+1
@@ -221,23 +220,26 @@ function generateLseqBetween(leftId, rightId) {
   return lseqToString(result);
 }
 
-// 초기 문자 ID 생성 (빈 문서에 첫 문자 삽입 시)
+// 초기 청크 ID 생성 (빈 문서에 첫 청크 삽입 시)
 function generateInitialLseq() {
   return lseqToString([LSEQ_MID]);
 }
 
 // ===============================
-// chars 배열 유틸 (로컬 캐시용)
+// 청크(Chunk) 배열 유틸
 // ===============================
+// 청크 구조: { id: string, text: string }
+// - id: LSEQ ID (청크 전체의 위치)
+// - text: 연속된 문자열 (1자 이상)
 
-// chars 배열에서 특정 ID의 인덱스 찾기 (이진 탐색)
-function findCharIndex(chars, id) {
+// 청크 배열에서 특정 ID의 인덱스 찾기 (이진 탐색)
+function findChunkIndex(chunks, id) {
   let lo = 0;
-  let hi = chars.length - 1;
+  let hi = chunks.length - 1;
 
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
-    const cmp = compareLseq(chars[mid].id, id);
+    const cmp = compareLseq(chunks[mid].id, id);
 
     if (cmp === 0) return mid;
     if (cmp < 0) lo = mid + 1;
@@ -247,27 +249,114 @@ function findCharIndex(chars, id) {
   return -1; // 찾지 못함
 }
 
-// chars 배열에 새 문자 삽입 (정렬 유지)
-function insertCharSorted(chars, newChar) {
+// 청크 배열에서 삽입 위치 찾기 (정렬 유지)
+function findChunkInsertPosition(chunks, id) {
   let lo = 0;
-  let hi = chars.length;
+  let hi = chunks.length;
 
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
-    if (compareLseq(chars[mid].id, newChar.id) < 0) {
+    if (compareLseq(chunks[mid].id, id) < 0) {
       lo = mid + 1;
     } else {
       hi = mid;
     }
   }
 
-  chars.splice(lo, 0, newChar);
   return lo;
 }
 
-// chars 배열을 문자열로 변환 (content 생성)
-function charsToContent(chars) {
-  return chars.map((c) => c.char).join("");
+// 청크 배열에 새 청크 삽입 (정렬 유지)
+function insertChunkSorted(chunks, newChunk) {
+  const pos = findChunkInsertPosition(chunks, newChunk.id);
+  chunks.splice(pos, 0, newChunk);
+  return pos;
+}
+
+// 청크 배열을 문자열로 변환 (content 생성)
+function chunksToContent(chunks) {
+  return chunks.map((c) => c.text).join("");
+}
+
+// 전체 문자 위치에서 해당 청크와 청크 내 오프셋 찾기
+// 반환: { chunkIndex, offset } 또는 null
+function findPositionInChunks(chunks, globalPosition) {
+  let currentPos = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    const chunkLen = chunks[i].text.length;
+    if (globalPosition < currentPos + chunkLen) {
+      return { chunkIndex: i, offset: globalPosition - currentPos };
+    }
+    currentPos += chunkLen;
+  }
+  // 문서 끝
+  return { chunkIndex: chunks.length, offset: 0 };
+}
+
+// 청크 ID와 오프셋으로 위치 정보 반환
+// 반환: { leftId, rightId } - 새 청크 삽입 시 사용할 경계 ID
+function getInsertBoundaries(chunks, chunkIndex, offset) {
+  if (chunks.length === 0) {
+    return { leftId: null, rightId: null };
+  }
+
+  // 청크 끝에 삽입 (다음 청크 앞)
+  if (chunkIndex >= chunks.length) {
+    return { leftId: chunks[chunks.length - 1].id, rightId: null };
+  }
+
+  const chunk = chunks[chunkIndex];
+
+  // 청크 맨 앞에 삽입
+  if (offset === 0) {
+    const leftId = chunkIndex > 0 ? chunks[chunkIndex - 1].id : null;
+    return { leftId, rightId: chunk.id };
+  }
+
+  // 청크 맨 뒤에 삽입
+  if (offset >= chunk.text.length) {
+    const rightId = chunkIndex < chunks.length - 1 ? chunks[chunkIndex + 1].id : null;
+    return { leftId: chunk.id, rightId };
+  }
+
+  // 청크 중간에 삽입 → 청크 분할 필요
+  return { leftId: chunk.id, rightId: chunk.id, needSplit: true, splitOffset: offset };
+}
+
+// ===============================
+// 구버전 호환: chars → chunks 변환
+// ===============================
+function charsToChunks(chars) {
+  if (!chars || chars.length === 0) return [];
+  
+  // 이미 청크 형태인지 확인 (text 필드 존재)
+  if (chars[0]?.text !== undefined) {
+    return chars;
+  }
+  
+  // 단일 문자 배열 → 청크 배열로 변환
+  // 연속된 ID를 가진 문자들을 하나의 청크로 병합하지 않고
+  // 각각 개별 청크로 유지 (호환성)
+  return chars.map(c => ({
+    id: c.id,
+    text: c.char || c.text || ""
+  }));
+}
+
+// 청크 → 단일 문자 배열 변환 (클라이언트 호환용)
+function chunksToChars(chunks) {
+  const chars = [];
+  for (const chunk of chunks) {
+    // 청크의 첫 문자는 청크 ID 사용
+    // 나머지 문자는 가상 ID 생성 (클라이언트에서 정렬용)
+    for (let i = 0; i < chunk.text.length; i++) {
+      chars.push({
+        id: i === 0 ? chunk.id : `${chunk.id}:${i}`,
+        char: chunk.text[i]
+      });
+    }
+  }
+  return chars;
 }
 
 // === 문서 상태 상수 ===
@@ -464,37 +553,39 @@ async function updateDocCache(docId, updates) {
   }, false);
 }
 
-// === LSEQ 문서 연산 함수 ===
+// === 청크 기반 LSEQ 문서 연산 함수 ===
 
-// 문서에 문자 삽입 (LSEQ 방식)
-// leftId: 삽입 위치 왼쪽 문자 ID (null이면 맨 앞)
-// rightId: 삽입 위치 오른쪽 문자 ID (null이면 맨 뒤)
-// value: 삽입할 문자
+// 문서에 텍스트 삽입 (청크 방식)
+// leftId: 삽입 위치 왼쪽 청크 ID (null이면 맨 앞)
+// rightId: 삽입 위치 오른쪽 청크 ID (null이면 맨 뒤)
+// text: 삽입할 텍스트 (1자 이상)
 // userId: 작업자 ID
-async function insertCharToDoc(docId, leftId, rightId, value, userId) {
+async function insertTextToDoc(docId, leftId, rightId, text, userId) {
   return await safeRedis(async () => {
     const doc = await getDocFromCache(docId);
     if (!doc) return null;
     if (doc.status !== DOC_STATUS.NORMAL) return null;
 
+    // chunks 배열 가져오기 (구버전 호환)
+    let chunks = doc.chunks || charsToChunks(doc.chars) || [];
+
     // 새 LSEQ ID 생성
     const newId = generateLseqBetween(leftId, rightId);
 
-    // 새 문자 객체
-    const newChar = {
+    // 새 청크 객체
+    const newChunk = {
       id: newId,
-      char: value,
+      text: text,
     };
 
-    // chars 배열에 삽입 (정렬 유지)
-    const chars = doc.chars || [];
-    insertCharSorted(chars, newChar);
+    // 청크 배열에 삽입 (정렬 유지)
+    insertChunkSorted(chunks, newChunk);
 
     // 로그 추가
     const logEntry = {
       op: "insert",
       id: newId,
-      char: value,
+      text: text,
       userId: userId,
       timestamp: Date.now(),
     };
@@ -505,11 +596,12 @@ async function insertCharToDoc(docId, leftId, rightId, value, userId) {
     const newVersion = incrementLogVersion(doc.snapshotVersion);
 
     // content 재생성
-    const newContent = charsToContent(chars);
+    const newContent = chunksToContent(chunks);
 
     const updated = {
       ...doc,
-      chars: chars,
+      chunks: chunks,
+      chars: chunksToChars(chunks), // 클라이언트 호환용
       content: newContent,
       logMetadata: logs,
       snapshotVersion: newVersion,
@@ -521,35 +613,74 @@ async function insertCharToDoc(docId, leftId, rightId, value, userId) {
     return {
       newVersion,
       newId,
-      char: value,
+      text: text,
       content: newContent,
     };
   }, null);
 }
 
-// 문서에서 문자 삭제 (LSEQ 방식)
-async function deleteCharFromDoc(docId, charId, userId) {
+// 청크 중간에 텍스트 삽입 (청크 분할)
+// chunkId: 분할할 청크 ID
+// offset: 분할 위치 (0-based)
+// text: 삽입할 텍스트
+async function insertTextInChunk(docId, chunkId, offset, text, userId) {
   return await safeRedis(async () => {
     const doc = await getDocFromCache(docId);
     if (!doc) return null;
     if (doc.status !== DOC_STATUS.NORMAL) return null;
 
-    const chars = doc.chars || [];
-    const index = findCharIndex(chars, charId);
+    let chunks = doc.chunks || charsToChunks(doc.chars) || [];
+    const chunkIndex = findChunkIndex(chunks, chunkId);
 
-    if (index === -1) {
-      // 이미 삭제된 문자거나 존재하지 않음
-      return { alreadyDeleted: true };
+    if (chunkIndex === -1) {
+      return null; // 청크를 찾을 수 없음
     }
 
-    const deletedChar = chars[index];
-    chars.splice(index, 1);
+    const chunk = chunks[chunkIndex];
+    
+    // 유효한 오프셋인지 확인
+    if (offset < 0 || offset > chunk.text.length) {
+      return null;
+    }
+
+    // 청크 분할
+    const leftText = chunk.text.substring(0, offset);
+    const rightText = chunk.text.substring(offset);
+
+    // 새 ID들 생성
+    const leftChunkId = chunk.id; // 기존 ID 유지
+    const nextChunkId = chunkIndex < chunks.length - 1 ? chunks[chunkIndex + 1].id : null;
+    
+    // 새 텍스트 청크 ID (기존 청크와 다음 청크 사이)
+    const newTextId = generateLseqBetween(leftChunkId, nextChunkId);
+    // 오른쪽 분할 청크 ID (새 텍스트와 다음 청크 사이)
+    const rightChunkId = generateLseqBetween(newTextId, nextChunkId);
+
+    // 기존 청크 제거
+    chunks.splice(chunkIndex, 1);
+
+    // 새 청크들 삽입 (순서 중요)
+    const newChunks = [];
+    if (leftText.length > 0) {
+      newChunks.push({ id: leftChunkId, text: leftText });
+    }
+    newChunks.push({ id: newTextId, text: text });
+    if (rightText.length > 0) {
+      newChunks.push({ id: rightChunkId, text: rightText });
+    }
+
+    // 각 청크를 정렬된 위치에 삽입
+    for (const nc of newChunks) {
+      insertChunkSorted(chunks, nc);
+    }
 
     // 로그 추가
     const logEntry = {
-      op: "delete",
-      id: charId,
-      char: deletedChar.char,
+      op: "insertInChunk",
+      chunkId: chunkId,
+      offset: offset,
+      text: text,
+      newIds: newChunks.map(c => c.id),
       userId: userId,
       timestamp: Date.now(),
     };
@@ -560,11 +691,12 @@ async function deleteCharFromDoc(docId, charId, userId) {
     const newVersion = incrementLogVersion(doc.snapshotVersion);
 
     // content 재생성
-    const newContent = charsToContent(chars);
+    const newContent = chunksToContent(chunks);
 
     const updated = {
       ...doc,
-      chars: chars,
+      chunks: chunks,
+      chars: chunksToChars(chunks),
       content: newContent,
       logMetadata: logs,
       snapshotVersion: newVersion,
@@ -575,10 +707,114 @@ async function deleteCharFromDoc(docId, charId, userId) {
 
     return {
       newVersion,
-      deletedId: charId,
+      newId: newTextId,
+      text: text,
+      splitResult: newChunks.map(c => ({ id: c.id, text: c.text })),
       content: newContent,
     };
   }, null);
+}
+
+// 문서에서 텍스트 삭제 (청크 또는 청크 일부)
+// chunkId: 삭제할 청크 ID
+// startOffset: 시작 위치 (옵션, 없으면 전체 삭제)
+// endOffset: 끝 위치 (옵션)
+async function deleteTextFromDoc(docId, chunkId, userId, startOffset = null, endOffset = null) {
+  return await safeRedis(async () => {
+    const doc = await getDocFromCache(docId);
+    if (!doc) return null;
+    if (doc.status !== DOC_STATUS.NORMAL) return null;
+
+    let chunks = doc.chunks || charsToChunks(doc.chars) || [];
+    const chunkIndex = findChunkIndex(chunks, chunkId);
+
+    if (chunkIndex === -1) {
+      return { alreadyDeleted: true };
+    }
+
+    const chunk = chunks[chunkIndex];
+    let deletedText = chunk.text;
+
+    if (startOffset !== null && endOffset !== null) {
+      // 부분 삭제 (청크 내 범위)
+      const leftText = chunk.text.substring(0, startOffset);
+      const rightText = chunk.text.substring(endOffset);
+      deletedText = chunk.text.substring(startOffset, endOffset);
+
+      if (leftText.length === 0 && rightText.length === 0) {
+        // 전체 삭제
+        chunks.splice(chunkIndex, 1);
+      } else if (leftText.length === 0) {
+        // 앞부분만 삭제
+        chunk.text = rightText;
+      } else if (rightText.length === 0) {
+        // 뒷부분만 삭제
+        chunk.text = leftText;
+      } else {
+        // 중간 삭제 → 청크 유지하고 텍스트만 수정
+        chunk.text = leftText + rightText;
+      }
+    } else {
+      // 전체 청크 삭제
+      chunks.splice(chunkIndex, 1);
+    }
+
+    // 로그 추가
+    const logEntry = {
+      op: "delete",
+      id: chunkId,
+      text: deletedText,
+      startOffset,
+      endOffset,
+      userId: userId,
+      timestamp: Date.now(),
+    };
+    const logs = doc.logMetadata || [];
+    logs.push(logEntry);
+
+    // 버전 증가
+    const newVersion = incrementLogVersion(doc.snapshotVersion);
+
+    // content 재생성
+    const newContent = chunksToContent(chunks);
+
+    const updated = {
+      ...doc,
+      chunks: chunks,
+      chars: chunksToChars(chunks),
+      content: newContent,
+      logMetadata: logs,
+      snapshotVersion: newVersion,
+      updatedAt: new Date().toISOString(),
+    };
+
+    await setDocToCache(docId, updated);
+
+    return {
+      newVersion,
+      deletedId: chunkId,
+      deletedText: deletedText,
+      content: newContent,
+    };
+  }, null);
+}
+
+// 구버전 호환: 단일 문자 삽입
+async function insertCharToDoc(docId, leftId, rightId, value, userId) {
+  return await insertTextToDoc(docId, leftId, rightId, value, userId);
+}
+
+// 구버전 호환: 단일 문자 삭제
+async function deleteCharFromDoc(docId, charId, userId) {
+  // charId가 청크 내 가상 ID인지 확인 (형식: "chunkId:offset")
+  if (charId.includes(":")) {
+    const [chunkId, offsetStr] = charId.split(":");
+    const offset = parseInt(offsetStr, 10);
+    // 해당 위치의 한 글자만 삭제
+    return await deleteTextFromDoc(docId, chunkId, userId, offset, offset + 1);
+  }
+  // 일반 청크 ID인 경우
+  return await deleteTextFromDoc(docId, charId, userId);
 }
 
 // === 문서 상태 관리 함수 ===
@@ -2808,26 +3044,20 @@ async function handleEditDoc(ws, data) {
   }
 }
 
-// === LSEQ Batch 편집 핸들러 (여러 문자 동시 처리) ===
-// 클라이언트가 여러 문자를 한 번에 삽입/삭제할 때 사용
-// operations: [{ intent: "insert", leftId, rightId, value }, { intent: "delete", id }, ...]
-// 임시 ID 지원: leftId/rightId에 "temp_N" 형식 사용 시 N번째 insert 결과 ID로 매핑
+// === 청크 기반 Batch 편집 핸들러 ===
+// 연속된 문자열을 하나의 청크로 처리하여 효율 극대화
+// 지원 작업:
+// - insertText: { intent: "insertText", leftId, rightId, text } - 텍스트 청크 삽입
+// - delete: { intent: "delete", id } - 청크 삭제
+// - deleteRange: { intent: "deleteRange", ids: [...] } - 여러 청크 삭제
+// 구버전 호환: insert (단일 문자)도 지원
 async function handleEditDocBatch(ws, data) {
-  const { docId, operations } = data;
+  const { docId, operations, text: batchText } = data;
   const userId = ws.user.id;
 
   // 필수값 검증
   if (!docId || typeof docId !== "string") {
     return sendSystemMessage(ws, "문서 ID를 입력해주세요.");
-  }
-  if (!Array.isArray(operations) || operations.length === 0) {
-    return sendSystemMessage(ws, "편집 작업 목록이 필요합니다.");
-  }
-  if (operations.length > 1000) {
-    return sendSystemMessage(
-      ws,
-      "한 번에 최대 1000개까지만 처리할 수 있습니다.",
-    );
   }
 
   // 현재 문서를 열람 중인지 확인
@@ -2849,51 +3079,115 @@ async function handleEditDocBatch(ws, data) {
       });
     }
 
+    // === 새로운 청크 기반 batch 처리 ===
+    // 클라이언트가 text + leftId + rightId를 직접 보내는 경우 (권장)
+    if (batchText && typeof batchText === "string" && batchText.length > 0) {
+      const { leftId, rightId } = data;
+      
+      const result = await insertTextToDoc(
+        docId,
+        leftId || null,
+        rightId || null,
+        batchText,
+        userId,
+      );
+
+      if (!result) {
+        return sendSystemMessage(ws, "텍스트 삽입에 실패했습니다.");
+      }
+
+      // 모든 문서 열람자에게 브로드캐스트
+      broadcastToDoc(docId, "docOpBatch", {
+        time: Date.now(),
+        docId: docId,
+        operations: [{
+          op: "insertText",
+          id: result.newId,
+          text: batchText,
+        }],
+        editedBy: userId,
+        logVersion: result.newVersion,
+      });
+
+      console.log(`청크 삽입: ${docId} id=${result.newId} len=${batchText.length} by ${userId}`);
+      return;
+    }
+
+    // === 구버전 호환: operations 배열 처리 ===
+    if (!Array.isArray(operations) || operations.length === 0) {
+      return sendSystemMessage(ws, "편집 작업 목록이 필요합니다.");
+    }
+
+    // 연속된 insert를 청크로 병합
+    const mergedOps = mergeConsecutiveInserts(operations);
+    
     const results = [];
     let lastVersion = null;
-
-    // 임시 ID → 실제 ID 매핑 테이블
-    // temp_0 → 첫 번째 insert 결과 ID, temp_1 → 두 번째 insert 결과 ID, ...
     const tempIdMap = new Map();
     let insertIndex = 0;
 
-    // 임시 ID를 실제 ID로 변환하는 헬퍼 함수
     const resolveTempId = (id) => {
       if (!id) return null;
-      // temp_N 형식인지 확인
       const match = id.match(/^temp_(\d+)$/);
       if (match) {
         const tempIndex = parseInt(match[1], 10);
         return tempIdMap.get(tempIndex) || null;
       }
-      return id; // 이미 실제 ID
+      return id;
     };
 
-    for (const op of operations) {
-      const { intent, leftId, rightId, id, value } = op;
-
-      if (intent === "insert") {
-        // INSERT 작업
-        if (typeof value !== "string" || value.length !== 1) {
-          insertIndex++; // 스킵해도 인덱스는 증가
+    for (const op of mergedOps) {
+      if (op.intent === "insertText" || (op.intent === "insert" && op.text)) {
+        // 청크 삽입 (여러 문자 한번에)
+        const text = op.text || op.value;
+        if (!text || text.length === 0) {
+          insertIndex++;
           continue;
         }
 
-        // 임시 ID를 실제 ID로 변환
-        const resolvedLeftId = resolveTempId(leftId);
-        const resolvedRightId = resolveTempId(rightId);
+        const resolvedLeftId = resolveTempId(op.leftId);
+        const resolvedRightId = resolveTempId(op.rightId);
 
-        const result = await insertCharToDoc(
+        const result = await insertTextToDoc(
+          docId,
+          resolvedLeftId,
+          resolvedRightId,
+          text,
+          userId,
+        );
+
+        if (result) {
+          tempIdMap.set(insertIndex, result.newId);
+          results.push({
+            op: "insertText",
+            id: result.newId,
+            text: text,
+          });
+          lastVersion = result.newVersion;
+        }
+        insertIndex++;
+
+      } else if (op.intent === "insert") {
+        // 단일 문자 삽입 (구버전 호환)
+        const value = op.value;
+        if (typeof value !== "string" || value.length !== 1) {
+          insertIndex++;
+          continue;
+        }
+
+        const resolvedLeftId = resolveTempId(op.leftId);
+        const resolvedRightId = resolveTempId(op.rightId);
+
+        const result = await insertTextToDoc(
           docId,
           resolvedLeftId,
           resolvedRightId,
           value,
           userId,
         );
-        if (result) {
-          // 현재 insert의 결과 ID를 매핑 테이블에 저장
-          tempIdMap.set(insertIndex, result.newId);
 
+        if (result) {
+          tempIdMap.set(insertIndex, result.newId);
           results.push({
             op: "insert",
             id: result.newId,
@@ -2902,21 +3196,36 @@ async function handleEditDocBatch(ws, data) {
           lastVersion = result.newVersion;
         }
         insertIndex++;
-      } else if (intent === "delete") {
-        // DELETE 작업
-        // 삭제할 ID도 임시 ID일 수 있음
-        const resolvedId = resolveTempId(id);
-        if (!resolvedId || typeof resolvedId !== "string") {
-          continue; // 잘못된 형식은 스킵
-        }
+
+      } else if (op.intent === "delete") {
+        const resolvedId = resolveTempId(op.id);
+        if (!resolvedId) continue;
 
         const result = await deleteCharFromDoc(docId, resolvedId, userId);
         if (result && !result.alreadyDeleted) {
           results.push({
             op: "delete",
             id: resolvedId,
+            text: result.deletedText,
           });
           lastVersion = result.newVersion;
+        }
+
+      } else if (op.intent === "deleteRange") {
+        // 여러 ID 삭제
+        for (const delId of (op.ids || [])) {
+          const resolvedId = resolveTempId(delId);
+          if (!resolvedId) continue;
+
+          const result = await deleteCharFromDoc(docId, resolvedId, userId);
+          if (result && !result.alreadyDeleted) {
+            results.push({
+              op: "delete",
+              id: resolvedId,
+              text: result.deletedText,
+            });
+            lastVersion = result.newVersion;
+          }
         }
       }
     }
@@ -2925,7 +3234,7 @@ async function handleEditDocBatch(ws, data) {
       return sendSystemMessage(ws, "처리된 작업이 없습니다.");
     }
 
-    // 모든 문서 열람자에게 브로드캐스트 (자신 포함)
+    // 모든 문서 열람자에게 브로드캐스트
     broadcastToDoc(docId, "docOpBatch", {
       time: Date.now(),
       docId: docId,
@@ -2934,11 +3243,72 @@ async function handleEditDocBatch(ws, data) {
       logVersion: lastVersion,
     });
 
-    console.log(`LSEQ Batch: ${docId} ${results.length}개 작업 by ${userId}`);
+    console.log(`Batch: ${docId} ${results.length}개 작업 by ${userId}`);
+
   } catch (error) {
     logError("DOC_EDIT_BATCH", error);
     sendSystemMessage(ws, "문서 편집 중 오류가 발생했습니다.");
   }
+}
+
+// 연속된 insert 작업을 하나의 청크로 병합
+function mergeConsecutiveInserts(operations) {
+  if (!operations || operations.length === 0) return [];
+
+  const merged = [];
+  let currentInsert = null;
+
+  for (let i = 0; i < operations.length; i++) {
+    const op = operations[i];
+
+    if (op.intent === "insert" && op.value && op.value.length === 1) {
+      // 단일 문자 insert
+      if (currentInsert === null) {
+        // 새 그룹 시작
+        currentInsert = {
+          intent: "insertText",
+          leftId: op.leftId,
+          rightId: op.rightId,
+          text: op.value,
+          startIndex: i,
+        };
+      } else {
+        // 이전 insert와 연결되는지 확인
+        // temp_N이 이전 insert의 인덱스를 가리키는지 확인
+        const prevIndex = currentInsert.startIndex + currentInsert.text.length - 1;
+        const expectedTempId = `temp_${prevIndex}`;
+        
+        if (op.leftId === expectedTempId && op.rightId === null) {
+          // 연속된 insert - 병합
+          currentInsert.text += op.value;
+        } else {
+          // 연속되지 않음 - 이전 그룹 저장 후 새 그룹 시작
+          merged.push(currentInsert);
+          currentInsert = {
+            intent: "insertText",
+            leftId: op.leftId,
+            rightId: op.rightId,
+            text: op.value,
+            startIndex: i,
+          };
+        }
+      }
+    } else {
+      // insert가 아닌 작업
+      if (currentInsert !== null) {
+        merged.push(currentInsert);
+        currentInsert = null;
+      }
+      merged.push(op);
+    }
+  }
+
+  // 마지막 그룹 저장
+  if (currentInsert !== null) {
+    merged.push(currentInsert);
+  }
+
+  return merged;
 }
 
 // === 문서 동기화 핸들러 (오너만 - Redis → Supabase) ===
