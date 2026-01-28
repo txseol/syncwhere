@@ -2811,6 +2811,7 @@ async function handleEditDoc(ws, data) {
 // === LSEQ Batch 편집 핸들러 (여러 문자 동시 처리) ===
 // 클라이언트가 여러 문자를 한 번에 삽입/삭제할 때 사용
 // operations: [{ intent: "insert", leftId, rightId, value }, { intent: "delete", id }, ...]
+// 임시 ID 지원: leftId/rightId에 "temp_N" 형식 사용 시 N번째 insert 결과 ID로 매핑
 async function handleEditDocBatch(ws, data) {
   const { docId, operations } = data;
   const userId = ws.user.id;
@@ -2851,23 +2852,48 @@ async function handleEditDocBatch(ws, data) {
     const results = [];
     let lastVersion = null;
 
+    // 임시 ID → 실제 ID 매핑 테이블
+    // temp_0 → 첫 번째 insert 결과 ID, temp_1 → 두 번째 insert 결과 ID, ...
+    const tempIdMap = new Map();
+    let insertIndex = 0;
+
+    // 임시 ID를 실제 ID로 변환하는 헬퍼 함수
+    const resolveTempId = (id) => {
+      if (!id) return null;
+      // temp_N 형식인지 확인
+      const match = id.match(/^temp_(\d+)$/);
+      if (match) {
+        const tempIndex = parseInt(match[1], 10);
+        return tempIdMap.get(tempIndex) || null;
+      }
+      return id; // 이미 실제 ID
+    };
+
     for (const op of operations) {
       const { intent, leftId, rightId, id, value } = op;
 
       if (intent === "insert") {
         // INSERT 작업
         if (typeof value !== "string" || value.length !== 1) {
-          continue; // 잘못된 형식은 스킵
+          insertIndex++; // 스킵해도 인덱스는 증가
+          continue;
         }
+
+        // 임시 ID를 실제 ID로 변환
+        const resolvedLeftId = resolveTempId(leftId);
+        const resolvedRightId = resolveTempId(rightId);
 
         const result = await insertCharToDoc(
           docId,
-          leftId || null,
-          rightId || null,
+          resolvedLeftId,
+          resolvedRightId,
           value,
           userId,
         );
         if (result) {
+          // 현재 insert의 결과 ID를 매핑 테이블에 저장
+          tempIdMap.set(insertIndex, result.newId);
+
           results.push({
             op: "insert",
             id: result.newId,
@@ -2875,17 +2901,20 @@ async function handleEditDocBatch(ws, data) {
           });
           lastVersion = result.newVersion;
         }
+        insertIndex++;
       } else if (intent === "delete") {
         // DELETE 작업
-        if (!id || typeof id !== "string") {
+        // 삭제할 ID도 임시 ID일 수 있음
+        const resolvedId = resolveTempId(id);
+        if (!resolvedId || typeof resolvedId !== "string") {
           continue; // 잘못된 형식은 스킵
         }
 
-        const result = await deleteCharFromDoc(docId, id, userId);
+        const result = await deleteCharFromDoc(docId, resolvedId, userId);
         if (result && !result.alreadyDeleted) {
           results.push({
             op: "delete",
-            id: id,
+            id: resolvedId,
           });
           lastVersion = result.newVersion;
         }
