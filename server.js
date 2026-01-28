@@ -776,7 +776,6 @@ async function onDocDisconnect(docId) {
 }
 
 // === 스냅샷 생성 함수 ===
-
 // 로그를 스냅샷으로 병합하고 새 버전 생성
 // 스냅샷: chars 배열에서 id와 char만 남기고 로그(userId, timestamp 등) 제거
 async function createSnapshot(docId) {
@@ -2431,10 +2430,7 @@ async function handleUpdateDoc(ws, data) {
   }
   if (newDepth !== undefined) {
     if (typeof newDepth !== "number" || newDepth < 0 || newDepth > 20) {
-      return sendSystemMessage(
-        ws,
-        "디렉토리 깊이가 올바르지 않습니다. (0~20)",
-      );
+      return sendSystemMessage(ws, "디렉토리 깊이가 올바르지 않습니다. (0~20)");
     }
   }
 
@@ -2751,7 +2747,13 @@ async function handleEditDoc(ws, data) {
       }
 
       // Redis에 삽입 (서버가 ID 생성)
-      const result = await insertCharToDoc(docId, leftId || null, rightId || null, value, userId);
+      const result = await insertCharToDoc(
+        docId,
+        leftId || null,
+        rightId || null,
+        value,
+        userId,
+      );
       if (!result) {
         return sendSystemMessage(ws, "문자 삽입에 실패했습니다.");
       }
@@ -2767,7 +2769,9 @@ async function handleEditDoc(ws, data) {
         logVersion: result.newVersion,
       });
 
-      console.log(`LSEQ 삽입: ${docId} id=${result.newId} char='${value}' by ${userId}`);
+      console.log(
+        `LSEQ 삽입: ${docId} id=${result.newId} char='${value}' by ${userId}`,
+      );
     } else if (intent === "delete") {
       // === DELETE 작업 ===
       if (!id || typeof id !== "string") {
@@ -2819,7 +2823,10 @@ async function handleEditDocBatch(ws, data) {
     return sendSystemMessage(ws, "편집 작업 목록이 필요합니다.");
   }
   if (operations.length > 1000) {
-    return sendSystemMessage(ws, "한 번에 최대 1000개까지만 처리할 수 있습니다.");
+    return sendSystemMessage(
+      ws,
+      "한 번에 최대 1000개까지만 처리할 수 있습니다.",
+    );
   }
 
   // 현재 문서를 열람 중인지 확인
@@ -2853,7 +2860,13 @@ async function handleEditDocBatch(ws, data) {
           continue; // 잘못된 형식은 스킵
         }
 
-        const result = await insertCharToDoc(docId, leftId || null, rightId || null, value, userId);
+        const result = await insertCharToDoc(
+          docId,
+          leftId || null,
+          rightId || null,
+          value,
+          userId,
+        );
         if (result) {
           results.push({
             op: "insert",
@@ -2963,7 +2976,9 @@ async function handleSyncDoc(ws, data) {
         channelId: channelId,
         synced: synced,
         snapshotVersion: doc.snapshotVersion,
-        message: synced ? "동기화가 완료되었습니다." : "동기화할 변경사항이 없습니다.",
+        message: synced
+          ? "동기화가 완료되었습니다."
+          : "동기화할 변경사항이 없습니다.",
       },
     });
 
@@ -3081,7 +3096,9 @@ async function handleSnapshotDoc(ws, data) {
       snapshotBy: userId,
     });
 
-    console.log(`스냅샷 생성: ${docId} by ${userId} (v${result.snapshotVersion})`);
+    console.log(
+      `스냅샷 생성: ${docId} by ${userId} (v${result.snapshotVersion})`,
+    );
   } catch (error) {
     logError("DOC_SNAPSHOT_HANDLER", error);
 
