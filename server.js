@@ -1411,13 +1411,21 @@ async function handleCreateDoc(ws, data) {
       parentDir = parentDoc.dir;
     }
 
-    // 같은 부모 아래 동일한 이름의 문서 존재 여부 확인
+    // 문서 생성 시 최종 dir 계산
+    // .option 파일: dir=폴더명
+    // 일반 문서: dir=부모폴더명
+    const finalDir = isDirectory ? dir : parentDir;
+
+    // 같은 부모 아래 동일한 dir+name 조합의 문서 존재 여부 확인
+    // .option: 같은 parentId 아래 같은 dir(폴더명)이 있으면 중복
+    // 일반 문서: 같은 parentId 아래 같은 name이 있으면 중복
     let existingDoc;
     try {
       existingDoc = await prisma.documentData.findFirst({
         where: {
           channelId: channelId,
           name: docName,
+          dir: finalDir,
           parentId: parentId,
           status: 0,
         },
@@ -1428,17 +1436,16 @@ async function handleCreateDoc(ws, data) {
     }
 
     if (existingDoc) {
-      return sendSystemMessage(ws, "같은 경로에 동일한 이름의 문서가 이미 존재합니다.");
+      const errorMsg = isDirectory 
+        ? `같은 경로에 '${dir}' 폴더가 이미 존재합니다.`
+        : `같은 경로에 '${docName}' 문서가 이미 존재합니다.`;
+      return sendSystemMessage(ws, errorMsg);
     }
 
     // UUID 중복 방지
     const docId = await generateUniqueId("documentData");
 
     // 문서 생성
-    // .option 파일: dir=폴더명
-    // 일반 문서: dir=부모폴더명
-    const finalDir = isDirectory ? dir : parentDir;
-    
     let document;
     try {
       document = await prisma.documentData.create({
@@ -1457,7 +1464,10 @@ async function handleCreateDoc(ws, data) {
     } catch (dbError) {
       logError("DB_DOC_CREATE", dbError);
       if (dbError.code === "P2002") {
-        return sendSystemMessage(ws, "같은 경로에 동일한 이름의 문서가 이미 존재합니다.");
+        const errorMsg = isDirectory 
+          ? `같은 경로에 '${dir}' 폴더가 이미 존재합니다.`
+          : `같은 경로에 '${docName}' 문서가 이미 존재합니다.`;
+        return sendSystemMessage(ws, errorMsg);
       }
       return sendSystemMessage(ws, "문서 생성 중 데이터베이스 오류가 발생했습니다.");
     }
@@ -2175,10 +2185,11 @@ async function handleUpdateDoc(ws, data) {
       }
     }
 
-    // 중복 체크 (parentId + name 기준)
+    // 중복 체크 (parentId + dir + name 기준)
     const nameToCheck = isOptionFile ? ".option" : finalDocName;
     if (
       nameToCheck !== document.name ||
+      finalDir !== document.dir ||
       finalParentId !== document.parentId
     ) {
       let existingDoc;
@@ -2187,6 +2198,7 @@ async function handleUpdateDoc(ws, data) {
           where: {
             channelId: channelId,
             name: nameToCheck,
+            dir: finalDir,
             parentId: finalParentId,
             status: 0,
             NOT: { id: docId },
