@@ -88,13 +88,16 @@ model DocumentData {
   updatedAt DateTime    @updatedAt @map("updated_at") @db.Timestamptz(6)
   depth     Int         @default(0)
   dir       String      @default("root")
+  parentId  String?     @map("parent_id") @db.Uuid
   channel   ChannelData @relation(fields: [channelId], references: [id], onDelete: Cascade)
   creator   UserData    @relation(fields: [createdBy], references: [id], onDelete: Cascade)
+  parent    DocumentData?  @relation("DocumentHierarchy", fields: [parentId], references: [id], onDelete: Cascade)
+  children  DocumentData[] @relation("DocumentHierarchy")
 
-  @@unique([channelId, dir, depth, name])
+  @@unique([channelId, parentId, name])
   @@index([channelId])
   @@index([createdBy])
   @@index([status])
-  @@index([dir, depth])
+  @@index([parentId])
   @@map("document_data")
 }

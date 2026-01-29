@@ -20,14 +20,14 @@ function logError(context, error) {
 }
 
 // 하위 항목들의 depth를 재귀적으로 업데이트 (폴더 이동 시)
-async function updateChildrenDepthRecursive(tx, channelId, parentDirName, parentDepth, depthDelta, updatedList) {
+// parentId를 기준으로 자식을 찾고 depth만 변경
+async function updateChildrenDepthRecursive(tx, channelId, parentId, depthDelta, updatedList) {
   try {
-    // 해당 디렉토리의 모든 직계 자식 찾기
+    // 해당 부모(parentId)의 모든 직계 자식 찾기
     const children = await tx.documentData.findMany({
       where: {
         channelId: channelId,
-        dir: parentDirName,
-        depth: parentDepth,
+        parentId: parentId,
         status: 0,
       },
     });
@@ -44,14 +44,15 @@ async function updateChildrenDepthRecursive(tx, channelId, parentDirName, parent
       updatedList.push({
         id: child.id,
         name: child.name,
+        dir: child.dir,
+        parentId: child.parentId,
         oldDepth: child.depth,
         newDepth: newChildDepth,
       });
 
-      // 이 자식이 .option 파일이면 해당 디렉토리의 하위도 업데이트
-      // .option 파일은 dir=폴더명 구조이므로 child.dir이 해당 폴더명
+      // 이 자식이 .option 파일이면 해당 폴더의 하위도 업데이트
       if (child.name === ".option") {
-        await updateChildrenDepthRecursive(tx, channelId, child.dir, newChildDepth + 1, depthDelta, updatedList);
+        await updateChildrenDepthRecursive(tx, channelId, child.id, depthDelta, updatedList);
       }
     }
   } catch (error) {
@@ -408,6 +409,7 @@ async function loadDocToCache(docId) {
         content: true,
         status: true,
         dir: true,
+        parentId: true,
         depth: true,
         createdBy: true,
         createdAt: true,
@@ -424,6 +426,7 @@ async function loadDocToCache(docId) {
       content: doc.content || "",
       status: doc.status,
       dir: doc.dir,
+      parentId: doc.parentId,
       depth: doc.depth,
       createdBy: doc.createdBy,
       createdAt: doc.createdAt.toISOString(),
@@ -942,6 +945,7 @@ async function handleCreateChannel(ws, data) {
     }
 
     // 채널 생성 후, 최상위 디렉토리 마커(.option) 문서 자동 생성
+    // root의 .option: dir="root", parentId=null, depth=0
     try {
       await prisma.documentData.create({
         data: {
@@ -949,6 +953,7 @@ async function handleCreateChannel(ws, data) {
           channelId: channel.id,
           name: ".option",
           dir: "root",
+          parentId: null,
           depth: 0,
           content: "",
           status: 0,
@@ -1316,11 +1321,15 @@ async function handleQuitChannel(ws, data) {
 // === 문서 핸들러 ===
 
 // 문서 생성 (디렉토리는 .option 파일로 표현)
+// 구조:
+// - .option 파일: dir=폴더명, parentId=부모폴더의 .option ID (root면 null), depth=자신의 depth
+// - 일반 문서: dir=속한폴더명, parentId=부모폴더의 .option ID (root면 null), depth=자신의 depth
 async function handleCreateDoc(ws, data) {
   // docName: 문서명 (.option이면 디렉토리 생성)
-  // dir: 상위 디렉토리명
-  // depth: 디렉토리 깊이
-  const { channelId, docName, dir = "root", depth = 0 } = data;
+  // dir: .option 파일인 경우 폴더명, 일반 문서면 속한 폴더명
+  // parentId: 부모 폴더의 .option 문서 ID (root 직계 자식이면 null)
+  // depth: 디렉토리 깊이 (root=0, root 직계 자식=1, ...)
+  const { channelId, docName, dir, parentId = null, depth = 1 } = data;
   const userId = ws.user.id;
 
   // 필수값 검증
@@ -1333,8 +1342,21 @@ async function handleCreateDoc(ws, data) {
   if (docName.length > 100) {
     return sendSystemMessage(ws, "문서명은 100자 이하로 입력해주세요.");
   }
-  if (typeof dir !== "string" || dir.length > 100) {
-    return sendSystemMessage(ws, "디렉토리명이 올바르지 않습니다.");
+  
+  // .option 파일(디렉토리)인 경우 dir(폴더명) 필수
+  const isDirectory = docName === ".option";
+  if (isDirectory) {
+    if (!dir || typeof dir !== "string" || dir.length === 0) {
+      return sendSystemMessage(ws, "디렉토리명(dir)을 입력해주세요.");
+    }
+    if (dir.length > 100) {
+      return sendSystemMessage(ws, "디렉토리명은 100자 이하로 입력해주세요.");
+    }
+  }
+  
+  // parentId 검증 (null 허용, 문자열이면 UUID 형식)
+  if (parentId !== null && typeof parentId !== "string") {
+    return sendSystemMessage(ws, "부모 폴더 ID가 올바르지 않습니다.");
   }
   if (typeof depth !== "number" || depth < 0 || depth > 20) {
     return sendSystemMessage(ws, "디렉토리 깊이가 올바르지 않습니다. (0~20)");
@@ -1371,15 +1393,32 @@ async function handleCreateDoc(ws, data) {
       return sendSystemMessage(ws, "문서 생성 권한이 없습니다.");
     }
 
-    // 같은 경로에 동일한 이름의 문서 존재 여부 확인
+    // parentId가 있으면 부모 폴더 존재 확인 및 dir 조회
+    let parentDir = "root";
+    if (parentId) {
+      const parentDoc = await prisma.documentData.findFirst({
+        where: {
+          id: parentId,
+          channelId: channelId,
+          name: ".option",
+          status: 0,
+        },
+        select: { dir: true },
+      });
+      if (!parentDoc) {
+        return sendSystemMessage(ws, "부모 폴더가 존재하지 않습니다.");
+      }
+      parentDir = parentDoc.dir;
+    }
+
+    // 같은 부모 아래 동일한 이름의 문서 존재 여부 확인
     let existingDoc;
     try {
       existingDoc = await prisma.documentData.findFirst({
         where: {
           channelId: channelId,
           name: docName,
-          dir: dir,
-          depth: depth,
+          parentId: parentId,
           status: 0,
         },
       });
@@ -1396,6 +1435,10 @@ async function handleCreateDoc(ws, data) {
     const docId = await generateUniqueId("documentData");
 
     // 문서 생성
+    // .option 파일: dir=폴더명
+    // 일반 문서: dir=부모폴더명
+    const finalDir = isDirectory ? dir : parentDir;
+    
     let document;
     try {
       document = await prisma.documentData.create({
@@ -1403,7 +1446,8 @@ async function handleCreateDoc(ws, data) {
           id: docId,
           channelId: channelId,
           name: docName,
-          dir: dir,
+          dir: finalDir,
+          parentId: parentId,
           depth: depth,
           content: "",
           status: DOC_STATUS.NORMAL,
@@ -1419,8 +1463,6 @@ async function handleCreateDoc(ws, data) {
     }
 
     // 채널 내 모든 유저에게 생성 알림 (자신 포함)
-    const isDirectory = docName === ".option";
-    
     broadcastToChannel(
       channelId,
       "docListChanged",
@@ -1430,7 +1472,8 @@ async function handleCreateDoc(ws, data) {
         action: "created",
         docId: document.id,
         docName: docName,
-        dir: dir,
+        dir: finalDir,
+        parentId: parentId,
         depth: depth,
         isDirectory: isDirectory,
         createdBy: userId,
@@ -1446,7 +1489,8 @@ async function handleCreateDoc(ws, data) {
         docId: document.id,
         channelId: channelId,
         docName: docName,
-        dir: dir,
+        dir: finalDir,
+        parentId: parentId,
         depth: depth,
         isDirectory: isDirectory,
         message: isDirectory 
@@ -1455,7 +1499,7 @@ async function handleCreateDoc(ws, data) {
       },
     });
 
-    console.log(`${isDirectory ? "디렉토리" : "문서"} 생성: ${isDirectory ? dir : docName} (${document.id}) in ${channelId} at ${dir}/${depth} by ${userId}`);
+    console.log(`${isDirectory ? "디렉토리" : "문서"} 생성: ${isDirectory ? dir : docName} (${document.id}) in ${channelId} parentId=${parentId} depth=${depth} by ${userId}`);
   } catch (error) {
     logError("DOC_CREATE", error);
     sendSystemMessage(ws, "문서 생성 중 오류가 발생했습니다.");
@@ -1552,7 +1596,9 @@ async function handleDeleteDoc(ws, data) {
         docId: docId,
         docName: document.name,
         dir: document.dir,
+        parentId: document.parentId,
         depth: document.depth,
+        isDirectory: document.name === ".option",
         deletedBy: userId,
       },
       ws, // 자신에게는 별도로 전송
@@ -1567,6 +1613,7 @@ async function handleDeleteDoc(ws, data) {
       message: `문서 '${document.name}'이 삭제되었습니다.`,
     });
 
+    const isDirectory = document.name === ".option";
     safeSend(ws, {
       event: "docDeleted",
       data: {
@@ -1575,8 +1622,12 @@ async function handleDeleteDoc(ws, data) {
         channelId: channelId,
         docName: document.name,
         dir: document.dir,
+        parentId: document.parentId,
         depth: document.depth,
-        message: `문서 '${document.name}'이 삭제되었습니다.`,
+        isDirectory: isDirectory,
+        message: isDirectory 
+          ? `폴더 '${document.dir}'가 삭제되었습니다.`
+          : `문서 '${document.name}'이 삭제되었습니다.`,
       },
     });
 
@@ -1637,10 +1688,11 @@ async function handleListDoc(ws, data) {
           channelId: true,
           name: true,
           dir: true,
+          parentId: true,
           depth: true,
           createdAt: true,
         },
-        orderBy: [{ dir: "asc" }, { depth: "asc" }, { name: "asc" }],
+        orderBy: [{ depth: "asc" }, { parentId: "asc" }, { name: "asc" }],
       });
     } catch (dbError) {
       logError("DB_DOC_LIST", dbError);
@@ -1660,6 +1712,7 @@ async function handleListDoc(ws, data) {
           channelId: d.channelId,
           name: d.name,
           dir: d.dir,
+          parentId: d.parentId,
           depth: d.depth,
           createdAt: d.createdAt.toISOString(),
         })),
@@ -1911,8 +1964,9 @@ async function handleEnterDoc(ws, data) {
         channelId: channelId,
         docName: document.name,
         dir: document.dir,
+        parentId: document.parentId,
         depth: document.depth,
-        isDirectory: document.isDirectory,
+        isDirectory: document.name === ".option",
         content: document.content,
         status: document.status,
         statusText:
@@ -1993,11 +2047,14 @@ async function handleLeaveDoc(ws, data) {
 
 // === 문서 수정 핸들러 (경로, 이름 변경) ===
 
+// parentId 기반 구조:
+// - 이름 변경 (rename): newName 지정
+//   - .option 파일: dir만 변경 (하위 항목은 parentId로 연결되어 있으므로 변경 불필요!)
+//   - 일반 문서: name만 변경
+// - 이동 (move): newParentId + newDepth 지정
+//   - parentId와 depth 변경 + 하위 항목들의 depth만 변경 (depthDelta 적용)
 async function handleUpdateDoc(ws, data) {
-  // newDir: 이동할 상위 디렉토리명 ("root", "pathA" 등)
-  // newDepth: 이동할 위치의 depth (0, 1, 2...)
-  // newName: 새 파일/폴더명 (이름 변경 시)
-  const { channelId, docId, newName, newDir, newDepth } = data;
+  const { channelId, docId, newName, newParentId, newDepth } = data;
   const userId = ws.user.id;
 
   // 필수값 검증
@@ -2009,7 +2066,7 @@ async function handleUpdateDoc(ws, data) {
   }
 
   // 수정할 값이 하나도 없으면
-  if (newName === undefined && newDir === undefined && newDepth === undefined) {
+  if (newName === undefined && newParentId === undefined && newDepth === undefined) {
     return sendSystemMessage(ws, "수정할 항목을 입력해주세요.");
   }
 
@@ -2022,13 +2079,9 @@ async function handleUpdateDoc(ws, data) {
       return sendSystemMessage(ws, "문서명은 100자 이하로 입력해주세요.");
     }
   }
-  if (newDir !== undefined) {
-    if (typeof newDir !== "string" || newDir.length === 0) {
-      return sendSystemMessage(ws, "디렉토리명이 올바르지 않습니다.");
-    }
-    if (newDir.length > 100) {
-      return sendSystemMessage(ws, "디렉토리명은 100자 이하로 입력해주세요.");
-    }
+  // newParentId: null 허용 (root로 이동), 문자열이면 UUID
+  if (newParentId !== undefined && newParentId !== null && typeof newParentId !== "string") {
+    return sendSystemMessage(ws, "부모 폴더 ID가 올바르지 않습니다.");
   }
   if (newDepth !== undefined) {
     if (typeof newDepth !== "number" || newDepth < 0 || newDepth > 20) {
@@ -2058,13 +2111,11 @@ async function handleUpdateDoc(ws, data) {
       return sendSystemMessage(ws, "채널이 존재하지 않습니다.");
     }
 
-    // 멤버십 확인
     const membership = channel.members[0];
     if (!membership) {
       return sendSystemMessage(ws, "해당 채널에 가입되어 있지 않습니다.");
     }
 
-    // 오너(생성자) 권한 확인
     if (membership.permission !== 0) {
       return sendSystemMessage(ws, "문서 수정 권한이 없습니다.");
     }
@@ -2088,25 +2139,55 @@ async function handleUpdateDoc(ws, data) {
       return sendSystemMessage(ws, "문서가 존재하지 않습니다.");
     }
 
-    // 최종 값 계산 (변경되지 않는 값은 기존값 유지)
-    const finalName = newName !== undefined ? newName : document.name;
-    const finalDir = newDir !== undefined ? newDir : document.dir;
-    const finalDepth = newDepth !== undefined ? newDepth : document.depth;
+    const isOptionFile = document.name === ".option";
+    
+    // root의 .option은 수정 불가 (최상위 디렉토리)
+    if (isOptionFile && document.parentId === null && document.depth === 0) {
+      return sendSystemMessage(ws, "최상위 디렉토리는 수정할 수 없습니다.");
+    }
 
-    // 경로/이름이 변경되는 경우 중복 체크
+    // 최종 값 계산
+    // 이름 변경: .option이면 dir 변경, 일반 문서면 name 변경
+    // 이동: parentId + depth 변경
+    const finalDir = isOptionFile && newName !== undefined ? newName : document.dir;
+    const finalParentId = newParentId !== undefined ? newParentId : document.parentId;
+    const finalDepth = newDepth !== undefined ? newDepth : document.depth;
+    
+    // 일반 문서의 이름 변경
+    const finalDocName = !isOptionFile && newName !== undefined ? newName : document.name;
+
+    // newParentId가 있으면 부모 폴더 존재 확인
+    if (finalParentId !== null && finalParentId !== document.parentId) {
+      const parentDoc = await prisma.documentData.findFirst({
+        where: {
+          id: finalParentId,
+          channelId: channelId,
+          name: ".option",
+          status: 0,
+        },
+      });
+      if (!parentDoc) {
+        return sendSystemMessage(ws, "이동할 부모 폴더가 존재하지 않습니다.");
+      }
+      // 자기 자신 또는 자신의 하위 폴더로 이동 방지
+      if (isOptionFile && finalParentId === docId) {
+        return sendSystemMessage(ws, "자기 자신의 하위로 이동할 수 없습니다.");
+      }
+    }
+
+    // 중복 체크 (parentId + name 기준)
+    const nameToCheck = isOptionFile ? ".option" : finalDocName;
     if (
-      finalName !== document.name ||
-      finalDir !== document.dir ||
-      finalDepth !== document.depth
+      nameToCheck !== document.name ||
+      finalParentId !== document.parentId
     ) {
       let existingDoc;
       try {
         existingDoc = await prisma.documentData.findFirst({
           where: {
             channelId: channelId,
-            name: finalName,
-            dir: finalDir,
-            depth: finalDepth,
+            name: nameToCheck,
+            parentId: finalParentId,
             status: 0,
             NOT: { id: docId },
           },
@@ -2119,14 +2200,13 @@ async function handleUpdateDoc(ws, data) {
       if (existingDoc) {
         return sendSystemMessage(
           ws,
-          `해당 경로에 '${finalName}' 이름의 문서가 이미 존재합니다.`,
+          `해당 경로에 '${isOptionFile ? finalDir : finalDocName}' 이름의 ${isOptionFile ? "폴더" : "문서"}가 이미 존재합니다.`,
         );
       }
     }
 
-    // .option 파일인 경우 (디렉토리) 하위 항목들도 함께 업데이트 필요
-    const isOptionFile = document.name === ".option";
     const depthDelta = finalDepth - document.depth;
+    const isMove = newParentId !== undefined || newDepth !== undefined;
     let updatedChildDocs = [];
 
     try {
@@ -2135,52 +2215,17 @@ async function handleUpdateDoc(ws, data) {
         await tx.documentData.update({
           where: { id: docId },
           data: {
-            name: finalName,
+            name: finalDocName,
             dir: finalDir,
+            parentId: finalParentId,
             depth: finalDepth,
           },
         });
 
-        // 2. .option 파일(디렉토리)이 이동/이름변경된 경우 하위 항목들의 dir/depth 업데이트
-        // .option 파일의 dir = 해당 디렉토리명
-        if (isOptionFile && (finalDir !== document.dir || depthDelta !== 0)) {
-          const oldDirName = document.dir;
-          const newDirName = finalDir;
-          const childDepth = document.depth + 1;
-          const newChildDepth = finalDepth + 1;
-
-          // 해당 디렉토리 내의 모든 직계 자식 항목
-          const childDocs = await tx.documentData.findMany({
-            where: {
-              channelId: channelId,
-              dir: oldDirName,
-              depth: childDepth,
-              status: 0,
-            },
-          });
-
-          for (const child of childDocs) {
-            await tx.documentData.update({
-              where: { id: child.id },
-              data: {
-                dir: newDirName,
-                depth: newChildDepth,
-              },
-            });
-            updatedChildDocs.push({
-              id: child.id,
-              name: child.name,
-              oldDepth: child.depth,
-              newDepth: newChildDepth,
-              oldDir: child.dir,
-              newDir: newDirName,
-            });
-
-            // 이 자식이 .option 파일이면 재귀적으로 하위도 업데이트
-            if (child.name === ".option") {
-              await updateChildrenDepthRecursive(tx, channelId, child.dir, newChildDepth + 1, depthDelta, updatedChildDocs);
-            }
-          }
+        // 2. .option 파일(디렉토리)이 이동된 경우 하위 항목들의 depth만 변경
+        // 이름 변경은 하위 항목에 영향 없음! (parentId로 연결되어 있으므로)
+        if (isOptionFile && isMove && depthDelta !== 0) {
+          await updateChildrenDepthRecursive(tx, channelId, docId, depthDelta, updatedChildDocs);
         }
       });
     } catch (dbError) {
@@ -2188,7 +2233,7 @@ async function handleUpdateDoc(ws, data) {
       if (dbError.code === "P2002") {
         return sendSystemMessage(
           ws,
-          `해당 경로에 '${finalName}' 이름의 문서가 이미 존재합니다.`,
+          `해당 경로에 동일한 이름의 ${isOptionFile ? "폴더" : "문서"}가 이미 존재합니다.`,
         );
       }
       return sendSystemMessage(
@@ -2199,11 +2244,14 @@ async function handleUpdateDoc(ws, data) {
 
     // 변경 내용 구성
     const changes = {};
-    if (finalName !== document.name) {
-      changes.name = { from: document.name, to: finalName };
+    if (finalDocName !== document.name) {
+      changes.name = { from: document.name, to: finalDocName };
     }
     if (finalDir !== document.dir) {
       changes.dir = { from: document.dir, to: finalDir };
+    }
+    if (finalParentId !== document.parentId) {
+      changes.parentId = { from: document.parentId, to: finalParentId };
     }
     if (finalDepth !== document.depth) {
       changes.depth = { from: document.depth, to: finalDepth };
@@ -2212,7 +2260,7 @@ async function handleUpdateDoc(ws, data) {
       changes.childrenUpdated = updatedChildDocs.length;
     }
 
-    // 채널 내 모든 유저에게 문서 변경 알림 (목록 새로고침 트리거)
+    // 채널 내 모든 유저에게 문서 변경 알림
     broadcastToChannel(
       channelId,
       "docUpdated",
@@ -2220,17 +2268,20 @@ async function handleUpdateDoc(ws, data) {
         time: Date.now(),
         docId: docId,
         channelId: channelId,
+        isDirectory: isOptionFile,
         oldName: document.name,
         oldDir: document.dir,
+        oldParentId: document.parentId,
         oldDepth: document.depth,
-        newName: finalName,
+        newName: finalDocName,
         newDir: finalDir,
+        newParentId: finalParentId,
         newDepth: finalDepth,
         changes: changes,
-        updatedChildren: updatedChildDocs, // 하위 항목 변경 내역
+        updatedChildren: updatedChildDocs,
         updatedBy: userId,
       },
-      ws, // 자신에게는 별도로 전송
+      ws,
     );
 
     // 문서 열람 중인 유저들에게도 알림
@@ -2240,8 +2291,9 @@ async function handleUpdateDoc(ws, data) {
       {
         time: Date.now(),
         docId: docId,
-        newName: finalName,
+        newName: finalDocName,
         newDir: finalDir,
+        newParentId: finalParentId,
         newDepth: finalDepth,
         changes: changes,
       },
@@ -2254,22 +2306,27 @@ async function handleUpdateDoc(ws, data) {
         time: Date.now(),
         docId: docId,
         channelId: channelId,
+        isDirectory: isOptionFile,
         oldName: document.name,
         oldDir: document.dir,
+        oldParentId: document.parentId,
         oldDepth: document.depth,
-        newName: finalName,
+        newName: finalDocName,
         newDir: finalDir,
+        newParentId: finalParentId,
         newDepth: finalDepth,
         changes: changes,
-        updatedChildren: updatedChildDocs, // 하위 항목 변경 내역
+        updatedChildren: updatedChildDocs,
         message: updatedChildDocs.length > 0 
-          ? `문서가 수정되었습니다. (하위 ${updatedChildDocs.length}개 항목 업데이트)`
-          : `문서가 수정되었습니다.`,
+          ? `${isOptionFile ? "폴더" : "문서"}가 수정되었습니다. (하위 ${updatedChildDocs.length}개 항목 업데이트)`
+          : `${isOptionFile ? "폴더" : "문서"}가 수정되었습니다.`,
       },
     });
 
+    const displayName = isOptionFile ? finalDir : finalDocName;
+    const oldDisplayName = isOptionFile ? document.dir : document.name;
     console.log(
-      `문서 수정: ${document.name} → ${finalName} (${docId}) in ${channelId} by ${userId}` +
+      `${isOptionFile ? "폴더" : "문서"} 수정: ${oldDisplayName} → ${displayName} (${docId}) in ${channelId} by ${userId}` +
       (updatedChildDocs.length > 0 ? ` (하위 ${updatedChildDocs.length}개 항목 depth 업데이트)` : ""),
     );
   } catch (error) {
