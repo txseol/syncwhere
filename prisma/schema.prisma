@@ -78,20 +78,18 @@ model ChannelMember {
 }
 
 model DocumentData {
-  id              String      @id @default(uuid()) @db.Uuid
-  channelId       String      @map("channel_id") @db.Uuid
-  name            String
-  content         String      @default("")
-  isDirectory     Boolean     @default(false) @map("is_directory")
-  permission      Int         @default(0)
-  status          Int         @default(0)
-  createdBy       String      @map("created_by") @db.Uuid
-  createdAt       DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt       DateTime    @updatedAt @map("updated_at") @db.Timestamptz(6)
-  depth           Int         @default(0)
-  dir             String      @default("root")
-  channel         ChannelData @relation(fields: [channelId], references: [id], onDelete: Cascade)
-  creator         UserData    @relation(fields: [createdBy], references: [id], onDelete: Cascade)
+  id        String      @id @default(uuid()) @db.Uuid
+  channelId String      @map("channel_id") @db.Uuid
+  name      String
+  content   String      @default("")
+  status    Int         @default(0)
+  createdBy String      @map("created_by") @db.Uuid
+  createdAt DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime    @updatedAt @map("updated_at") @db.Timestamptz(6)
+  depth     Int         @default(0)
+  dir       String      @default("root")
+  channel   ChannelData @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  creator   UserData    @relation(fields: [createdBy], references: [id], onDelete: Cascade)
 
   @@unique([channelId, dir, depth, name])
   @@index([channelId])
