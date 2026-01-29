@@ -941,6 +941,25 @@ async function handleCreateChannel(ws, data) {
       );
     }
 
+    // 채널 생성 후, 최상위 디렉토리 마커(.option) 문서 자동 생성
+    try {
+      await prisma.documentData.create({
+        data: {
+          id: await generateUniqueId("documentData"),
+          channelId: channel.id,
+          name: ".option",
+          dir: "root",
+          depth: 0,
+          content: "",
+          status: 0,
+          createdBy: userId,
+        },
+      });
+    } catch (docError) {
+      logError("ROOT_OPTION_CREATE", docError);
+      return sendSystemMessage(ws, "채널 생성은 성공했으나, 최상위 디렉토리(.option) 생성에 실패했습니다.");
+    }
+
     safeSend(ws, {
       event: "channelCreated",
       data: {
