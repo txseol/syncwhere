@@ -94,7 +94,7 @@ model DocumentData {
   parent    DocumentData?  @relation("DocumentHierarchy", fields: [parentId], references: [id], onDelete: Cascade)
   children  DocumentData[] @relation("DocumentHierarchy")
 
-  @@unique([channelId, parentId, name])
+  @@unique([channelId, parentId, name, dir])
   @@index([channelId])
   @@index([createdBy])
   @@index([status])
