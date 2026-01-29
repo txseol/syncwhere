@@ -19,6 +19,46 @@ function logError(context, error) {
   console.error(`[${context}] ${code}: ${message}`);
 }
 
+// 하위 항목들의 depth를 재귀적으로 업데이트
+async function updateChildrenDepthRecursive(tx, channelId, parentDirName, parentDepth, depthDelta, updatedList) {
+  try {
+    // 해당 디렉토리의 모든 직계 자식 찾기
+    const children = await tx.documentData.findMany({
+      where: {
+        channelId: channelId,
+        dir: parentDirName,
+        depth: parentDepth,
+        status: 0,
+      },
+    });
+
+    for (const child of children) {
+      const newChildDepth = child.depth + depthDelta;
+      
+      // 자식 depth 업데이트
+      await tx.documentData.update({
+        where: { id: child.id },
+        data: { depth: newChildDepth },
+      });
+
+      updatedList.push({
+        id: child.id,
+        name: child.name,
+        oldDepth: child.depth,
+        newDepth: newChildDepth,
+      });
+
+      // 이 자식이 디렉토리인 경우 재귀 호출
+      if (child.isDirectory) {
+        await updateChildrenDepthRecursive(tx, channelId, child.name, newChildDepth + 1, depthDelta, updatedList);
+      }
+    }
+  } catch (error) {
+    logError("UPDATE_CHILDREN_DEPTH", error);
+    throw error;
+  }
+}
+
 // 안전한 WebSocket 전송
 function safeSend(ws, data) {
   try {
@@ -72,55 +112,6 @@ async function generateUniqueId(model, maxRetries = 5) {
   }
   // 최대 재시도 초과 시에도 새 UUID 반환 (극히 드문 경우)
   return generateUUID();
-}
-
-// === 문서 버전 유틸리티 (서비스버전.스냅샷버전.로그버전) ===
-const SERVICE_VERSION = "1"; // 현재 서비스 버전
-
-// 버전 문자열 파싱 (예: "1.2.3" → { service: 1, snapshot: 2, log: 3 })
-function parseVersion(versionStr) {
-  const parts = (versionStr || "1.0.0").split(".");
-  return {
-    service: parseInt(parts[0]) || 1,
-    snapshot: parseInt(parts[1]) || 0,
-    log: parseInt(parts[2]) || 0,
-  };
-}
-
-// 버전 객체를 문자열로 변환
-function stringifyVersion(versionObj) {
-  return `${versionObj.service}.${versionObj.snapshot}.${versionObj.log}`;
-}
-
-// 버전 비교 (-1: a < b, 0: a == b, 1: a > b)
-function compareVersion(a, b) {
-  const vA = typeof a === "string" ? parseVersion(a) : a;
-  const vB = typeof b === "string" ? parseVersion(b) : b;
-
-  if (vA.service !== vB.service) return vA.service > vB.service ? 1 : -1;
-  if (vA.snapshot !== vB.snapshot) return vA.snapshot > vB.snapshot ? 1 : -1;
-  if (vA.log !== vB.log) return vA.log > vB.log ? 1 : -1;
-  return 0;
-}
-
-// 로그 버전 증가
-function incrementLogVersion(versionStr) {
-  const v = parseVersion(versionStr);
-  v.log += 1;
-  return stringifyVersion(v);
-}
-
-// 스냅샷 버전 증가 (로그 버전 리셋)
-function incrementSnapshotVersion(versionStr) {
-  const v = parseVersion(versionStr);
-  v.snapshot += 1;
-  v.log = 0;
-  return stringifyVersion(v);
-}
-
-// 초기 버전 생성
-function createInitialVersion() {
-  return `${SERVICE_VERSION}.0.0`;
 }
 
 // === 문서 상태 상수 ===
@@ -374,7 +365,7 @@ async function syncDocToSupabase(docId) {
     // Supabase 문서 조회
     const dbDoc = await prisma.documentData.findUnique({
       where: { id: docId },
-      select: { snapshotVersion: true, status: true },
+      select: { status: true },
     });
 
     if (!dbDoc) {
@@ -389,23 +380,15 @@ async function syncDocToSupabase(docId) {
       return false;
     }
 
-    // 버전 비교: Redis > Supabase인 경우에만 동기화
-    if (compareVersion(cachedDoc.snapshotVersion, dbDoc.snapshotVersion) > 0) {
-      await prisma.documentData.update({
-        where: { id: docId },
-        data: {
-          content: cachedDoc.content,
-          snapshotVersion: cachedDoc.snapshotVersion,
-        },
-      });
-      console.log(
-        `동기화 완료: ${docId} (${dbDoc.snapshotVersion} → ${cachedDoc.snapshotVersion})`,
-      );
-      return true;
-    }
-
-    console.log(`동기화 스킵 (버전 동일/낮음): ${docId}`);
-    return false;
+    // 캠시 내용을 DB에 동기화
+    await prisma.documentData.update({
+      where: { id: docId },
+      data: {
+        content: cachedDoc.content,
+      },
+    });
+    console.log(`동기화 완료: ${docId}`);
+    return true;
   } catch (error) {
     logError("DOC_SYNC", error);
     return false;
@@ -422,7 +405,7 @@ async function loadDocToCache(docId) {
         channelId: true,
         name: true,
         content: true,
-        snapshotVersion: true,
+        isDirectory: true,
         status: true,
         dir: true,
         depth: true,
@@ -439,7 +422,7 @@ async function loadDocToCache(docId) {
       channelId: doc.channelId,
       name: doc.name,
       content: doc.content || "",
-      snapshotVersion: doc.snapshotVersion,
+      isDirectory: doc.isDirectory,
       status: doc.status,
       dir: doc.dir,
       depth: doc.depth,
@@ -1314,9 +1297,11 @@ async function handleQuitChannel(ws, data) {
 
 // === 문서 핸들러 ===
 
-// 문서 생성 (LSEQ CRDT 기반)
+// 문서/디렉토리 생성
 async function handleCreateDoc(ws, data) {
-  const { channelId, docName, dir = "root", depth = 0 } = data;
+  // parentDir: 부모 디렉토리 경로 ("root" 또는 "root/pathA" 등)
+  // isDirectory: true이면 디렉토리 생성
+  const { channelId, docName, parentDir = "root", isDirectory = false } = data;
   const userId = ws.user.id;
 
   // 필수값 검증
@@ -1329,11 +1314,23 @@ async function handleCreateDoc(ws, data) {
   if (docName.length > 100) {
     return sendSystemMessage(ws, "문서명은 100자 이하로 입력해주세요.");
   }
-  if (typeof dir !== "string" || dir.length > 100) {
-    return sendSystemMessage(ws, "디렉토리명이 올바르지 않습니다.");
+  if (typeof parentDir !== "string" || parentDir.length > 500) {
+    return sendSystemMessage(ws, "부모 디렉토리 경로가 올바르지 않습니다.");
   }
-  if (typeof depth !== "number" || depth < 0 || depth > 20) {
-    return sendSystemMessage(ws, "디렉토리 깊이가 올바르지 않습니다. (0~20)");
+
+  // parentDir에서 dir과 depth 계산
+  // 예: parentDir="root" → dir="root", depth=0
+  // 예: parentDir="root/pathA" → dir="pathA", depth=1
+  const pathParts = parentDir.split("/").filter(p => p.length > 0);
+  if (pathParts.length === 0 || pathParts[0] !== "root") {
+    return sendSystemMessage(ws, "경로는 'root'로 시작해야 합니다.");
+  }
+  
+  const depth = pathParts.length - 1;
+  const dir = pathParts[pathParts.length - 1];
+  
+  if (depth > 20) {
+    return sendSystemMessage(ws, "디렉토리 깊이가 너무 깊습니다. (최대 20)");
   }
 
   try {
@@ -1369,7 +1366,33 @@ async function handleCreateDoc(ws, data) {
       return sendSystemMessage(ws, "문서 생성 권한이 없습니다.");
     }
 
-    // 같은 경로에 동일한 이름의 문서 존재 여부 확인 (삭제되지 않은 문서만)
+    // 경로 유효성 검증: 부모 디렉토리가 존재하는지 확인 (root 제외)
+    if (depth > 0) {
+      // 부모 디렉토리(isDirectory=true)가 존재해야 함
+      let parentDirectory;
+      try {
+        parentDirectory = await prisma.documentData.findFirst({
+          where: {
+            channelId: channelId,
+            name: dir,
+            isDirectory: true,
+            status: 0,
+          },
+        });
+      } catch (dbError) {
+        logError("DB_DOC_FIND_PARENT", dbError);
+        return sendSystemMessage(ws, "부모 디렉토리 확인 중 오류가 발생했습니다.");
+      }
+
+      if (!parentDirectory) {
+        return sendSystemMessage(
+          ws,
+          `부모 디렉토리 '${dir}'가 존재하지 않습니다. 먼저 디렉토리를 생성해주세요.`,
+        );
+      }
+    }
+
+    // 같은 경로에 동일한 이름의 문서 존재 여부 확인
     let existingDoc;
     try {
       existingDoc = await prisma.documentData.findFirst({
@@ -1389,17 +1412,16 @@ async function handleCreateDoc(ws, data) {
     if (existingDoc) {
       return sendSystemMessage(
         ws,
-        "같은 경로에 동일한 이름의 문서가 이미 존재합니다.",
+        isDirectory 
+          ? `'${docName}' 디렉토리가 이미 존재합니다.`
+          : "같은 경로에 동일한 이름의 문서가 이미 존재합니다.",
       );
     }
 
     // UUID 중복 방지
     const docId = await generateUniqueId("documentData");
 
-    // 초기 버전 생성
-    const initialVersion = createInitialVersion();
-
-    // 문서 생성 (LSEQ CRDT 초기 상태)
+    // 문서/디렉토리 생성
     let document;
     try {
       document = await prisma.documentData.create({
@@ -1409,21 +1431,21 @@ async function handleCreateDoc(ws, data) {
           name: docName,
           dir: dir,
           depth: depth,
-          content: "", // 초기 본문 비어있음
-          logMetadata: [], // 초기 로그 비어있음 (LSEQ 편집 기록용)
-          snapshotVersion: initialVersion, // "1.0.0" 형식
-          permission: 0, // 채널 멤버 전체 편집 가능
+          isDirectory: isDirectory,
+          content: "",
+          permission: 0,
           status: DOC_STATUS.NORMAL,
           createdBy: userId,
         },
       });
     } catch (dbError) {
       logError("DB_DOC_CREATE", dbError);
-      // unique constraint 위반 시
       if (dbError.code === "P2002") {
         return sendSystemMessage(
           ws,
-          "같은 경로에 동일한 이름의 문서가 이미 존재합니다.",
+          isDirectory 
+            ? `'${docName}' 디렉토리가 이미 존재합니다.`
+            : "같은 경로에 동일한 이름의 문서가 이미 존재합니다.",
         );
       }
       return sendSystemMessage(
@@ -1432,7 +1454,7 @@ async function handleCreateDoc(ws, data) {
       );
     }
 
-    // 채널 내 모든 유저에게 문서 생성 알림 (목록 새로고침 트리거)
+    // 채널 내 모든 유저에게 생성 알림 (목록 새로고침 트리거)
     broadcastToChannel(
       channelId,
       "docListChanged",
@@ -1444,13 +1466,15 @@ async function handleCreateDoc(ws, data) {
         docName: docName,
         dir: dir,
         depth: depth,
+        parentDir: parentDir,
+        isDirectory: isDirectory,
         createdBy: userId,
       },
-      ws, // 자신에게는 별도로 전송
+      ws,
     );
 
     safeSend(ws, {
-      event: "docCreated",
+      event: isDirectory ? "directoryCreated" : "docCreated",
       data: {
         time: Date.now(),
         docId: document.id,
@@ -1458,13 +1482,16 @@ async function handleCreateDoc(ws, data) {
         docName: docName,
         dir: dir,
         depth: depth,
-        snapshotVersion: document.snapshotVersion,
-        message: `문서 '${docName}'이 생성되었습니다.`,
+        parentDir: parentDir,
+        isDirectory: isDirectory,
+        message: isDirectory 
+          ? `디렉토리 '${docName}'이 생성되었습니다.`
+          : `문서 '${docName}'이 생성되었습니다.`,
       },
     });
 
     console.log(
-      `문서 생성: ${docName} (${document.id}) in ${channelId} at ${dir}/${depth} by ${userId}`,
+      `${isDirectory ? "디렉토리" : "문서"} 생성: ${docName} (${document.id}) in ${channelId} at ${dir}/${depth} by ${userId}`,
     );
   } catch (error) {
     logError("DOC_CREATE", error);
@@ -1648,8 +1675,8 @@ async function handleListDoc(ws, data) {
           name: true,
           dir: true,
           depth: true,
+          isDirectory: true,
           createdAt: true,
-          snapshotVersion: true,
         },
         orderBy: [{ dir: "asc" }, { depth: "asc" }, { name: "asc" }],
       });
@@ -1672,8 +1699,8 @@ async function handleListDoc(ws, data) {
           name: d.name,
           dir: d.dir,
           depth: d.depth,
+          isDirectory: d.isDirectory,
           createdAt: d.createdAt.toISOString(),
-          snapshotVersion: d.snapshotVersion,
         })),
       },
     });
@@ -1924,8 +1951,8 @@ async function handleEnterDoc(ws, data) {
         docName: document.name,
         dir: document.dir,
         depth: document.depth,
+        isDirectory: document.isDirectory,
         content: document.content,
-        snapshotVersion: document.snapshotVersion,
         status: document.status,
         statusText:
           document.status === DOC_STATUS.NORMAL
@@ -2006,6 +2033,9 @@ async function handleLeaveDoc(ws, data) {
 // === 문서 수정 핸들러 (경로, 이름 변경) ===
 
 async function handleUpdateDoc(ws, data) {
+  // newDir: 이동할 상위 디렉토리명 ("root", "pathA" 등)
+  // newDepth: 이동할 위치의 depth (0, 1, 2...)
+  // newName: 새 파일/폴더명 (이름 변경 시)
   const { channelId, docId, newName, newDir, newDepth } = data;
   const userId = ws.user.id;
 
@@ -2032,8 +2062,11 @@ async function handleUpdateDoc(ws, data) {
     }
   }
   if (newDir !== undefined) {
-    if (typeof newDir !== "string" || newDir.length > 100) {
+    if (typeof newDir !== "string" || newDir.length === 0) {
       return sendSystemMessage(ws, "디렉토리명이 올바르지 않습니다.");
+    }
+    if (newDir.length > 100) {
+      return sendSystemMessage(ws, "디렉토리명은 100자 이하로 입력해주세요.");
     }
   }
   if (newDepth !== undefined) {
@@ -2094,10 +2127,32 @@ async function handleUpdateDoc(ws, data) {
       return sendSystemMessage(ws, "문서가 존재하지 않습니다.");
     }
 
-    // 최종 경로 계산 (변경되지 않는 값은 기존값 유지)
+    // 최종 값 계산 (변경되지 않는 값은 기존값 유지)
     const finalName = newName !== undefined ? newName : document.name;
     const finalDir = newDir !== undefined ? newDir : document.dir;
     const finalDepth = newDepth !== undefined ? newDepth : document.depth;
+
+    // 이동하는 경우 대상 디렉토리 존재 확인 (root 제외)
+    if ((newDir !== undefined || newDepth !== undefined) && finalDir !== "root") {
+      let targetDirectory;
+      try {
+        targetDirectory = await prisma.documentData.findFirst({
+          where: {
+            channelId: channelId,
+            name: finalDir,
+            isDirectory: true,
+            status: 0,
+          },
+        });
+      } catch (dbError) {
+        logError("DB_DIR_FIND", dbError);
+        return sendSystemMessage(ws, "디렉토리 조회 중 오류가 발생했습니다.");
+      }
+
+      if (!targetDirectory) {
+        return sendSystemMessage(ws, `대상 디렉토리 '${finalDir}'가 존재하지 않습니다.`);
+      }
+    }
 
     // 경로/이름이 변경되는 경우 중복 체크
     if (
@@ -2130,16 +2185,61 @@ async function handleUpdateDoc(ws, data) {
       }
     }
 
-    // 문서 업데이트
-    let updatedDoc;
+    // 문서 업데이트 (디렉토리인 경우 하위 항목들도 함께 업데이트)
+    const depthDelta = finalDepth - document.depth;
+    let updatedChildDocs = [];
+
     try {
-      updatedDoc = await prisma.documentData.update({
-        where: { id: docId },
-        data: {
-          name: finalName,
-          dir: finalDir,
-          depth: finalDepth,
-        },
+      // 트랜잭션으로 처리
+      await prisma.$transaction(async (tx) => {
+        // 1. 현재 문서 업데이트
+        await tx.documentData.update({
+          where: { id: docId },
+          data: {
+            name: finalName,
+            dir: finalDir,
+            depth: finalDepth,
+          },
+        });
+
+        // 2. 디렉토리인 경우 하위 항목들의 dir/depth 업데이트
+        if (document.isDirectory) {
+          const childDepth = document.depth + 1;
+          const newChildDepth = finalDepth + 1;
+
+          // 해당 디렉토리 내의 모든 직계 자식 항목
+          const childDocs = await tx.documentData.findMany({
+            where: {
+              channelId: channelId,
+              dir: document.name,
+              depth: childDepth,
+              status: 0,
+            },
+          });
+
+          for (const child of childDocs) {
+            await tx.documentData.update({
+              where: { id: child.id },
+              data: {
+                dir: finalName, // 폴더 이름이 변경된 경우
+                depth: newChildDepth,
+              },
+            });
+            updatedChildDocs.push({
+              id: child.id,
+              name: child.name,
+              oldDepth: child.depth,
+              newDepth: newChildDepth,
+              oldDir: child.dir,
+              newDir: finalName,
+            });
+
+            // 이 자식이 디렉토리인 경우 재귀적으로 하위도 업데이트
+            if (child.isDirectory) {
+              await updateChildrenDepthRecursive(tx, channelId, child.name, newChildDepth + 1, depthDelta, updatedChildDocs);
+            }
+          }
+        }
       });
     } catch (dbError) {
       logError("DB_DOC_UPDATE", dbError);
@@ -2157,14 +2257,17 @@ async function handleUpdateDoc(ws, data) {
 
     // 변경 내용 구성
     const changes = {};
-    if (newName !== undefined && newName !== document.name) {
-      changes.name = { from: document.name, to: newName };
+    if (finalName !== document.name) {
+      changes.name = { from: document.name, to: finalName };
     }
-    if (newDir !== undefined && newDir !== document.dir) {
-      changes.dir = { from: document.dir, to: newDir };
+    if (finalDir !== document.dir) {
+      changes.dir = { from: document.dir, to: finalDir };
     }
-    if (newDepth !== undefined && newDepth !== document.depth) {
-      changes.depth = { from: document.depth, to: newDepth };
+    if (finalDepth !== document.depth) {
+      changes.depth = { from: document.depth, to: finalDepth };
+    }
+    if (updatedChildDocs.length > 0) {
+      changes.childrenUpdated = updatedChildDocs.length;
     }
 
     // 채널 내 모든 유저에게 문서 변경 알림 (목록 새로고침 트리거)
@@ -2182,6 +2285,7 @@ async function handleUpdateDoc(ws, data) {
         newDir: finalDir,
         newDepth: finalDepth,
         changes: changes,
+        updatedChildren: updatedChildDocs, // 하위 항목 변경 내역
         updatedBy: userId,
       },
       ws, // 자신에게는 별도로 전송
@@ -2215,12 +2319,16 @@ async function handleUpdateDoc(ws, data) {
         newDir: finalDir,
         newDepth: finalDepth,
         changes: changes,
-        message: `문서가 수정되었습니다.`,
+        updatedChildren: updatedChildDocs, // 하위 항목 변경 내역
+        message: updatedChildDocs.length > 0 
+          ? `문서가 수정되었습니다. (하위 ${updatedChildDocs.length}개 항목 업데이트)`
+          : `문서가 수정되었습니다.`,
       },
     });
 
     console.log(
-      `문서 수정: ${document.name} → ${finalName} (${docId}) in ${channelId} by ${userId}`,
+      `문서 수정: ${document.name} → ${finalName} (${docId}) in ${channelId} by ${userId}` +
+      (updatedChildDocs.length > 0 ? ` (하위 ${updatedChildDocs.length}개 항목 depth 업데이트)` : ""),
     );
   } catch (error) {
     logError("DOC_UPDATE", error);
@@ -2338,7 +2446,6 @@ async function handleGetDocStatus(ws, data) {
           : doc.status === DOC_STATUS.DELETED
             ? "deleted"
             : "locked",
-      snapshotVersion: doc.snapshotVersion,
     },
   });
 }
